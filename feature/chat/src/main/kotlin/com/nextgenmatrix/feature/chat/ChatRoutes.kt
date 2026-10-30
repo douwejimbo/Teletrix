@@ -457,6 +457,7 @@ fun ConversationRoute(
     val draft by viewModel.draft.collectAsStateWithLifecycle()
     val scrollRestoreEventId by viewModel.scrollRestoreEventId.collectAsStateWithLifecycle()
     val scrollToLatestSignal by viewModel.scrollToLatestSignal.collectAsStateWithLifecycle()
+    val jumpToEventId by viewModel.jumpToEventId.collectAsStateWithLifecycle()
     val pendingComposeReply by viewModel.pendingReply.collectAsStateWithLifecycle()
     val nowPlaying by viewModel.nowPlaying.collectAsStateWithLifecycle()
     val preparingTrackId by viewModel.preparingTrackId.collectAsStateWithLifecycle()
@@ -506,6 +507,9 @@ fun ConversationRoute(
         onPersistScrollAnchor = { eventId -> viewModel.persistScrollAnchor(roomId, eventId) },
         onReadReceiptForEvent = { eventId -> viewModel.updateRoomReadReceipts(roomId, eventId) },
         scrollToLatestSignal = scrollToLatestSignal,
+        jumpToEventId = jumpToEventId,
+        onConsumeJumpToEvent = viewModel::consumeJumpToEvent,
+        onJumpToReply = viewModel::jumpToReply,
         pendingComposeReply = pendingComposeReply,
         onClearComposeReply = viewModel::clearComposeReply,
         onReplyToMessage = viewModel::setComposeReply,

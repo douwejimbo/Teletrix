@@ -145,6 +145,18 @@ data class PusherConfig(
     val deviceToken: String,
 )
 
+/** A message the homeserver wants shown as a system notification. */
+data class IncomingNotification(
+    val roomId: String,
+    val eventId: String,
+    val roomTitle: String,
+    val senderName: String,
+    val body: String,
+    val isDirect: Boolean,
+    val isInvite: Boolean = false,
+    val noisy: Boolean = true,
+)
+
 data class ModerationCapabilities(
     val canChangePowerLevels: Boolean,
     val canKick: Boolean,

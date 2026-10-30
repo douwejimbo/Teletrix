@@ -88,6 +88,8 @@ import androidx.compose.material.icons.outlined.Mood
 import androidx.compose.material.icons.outlined.Notifications
 import androidx.compose.material.icons.outlined.Videocam
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilledTonalButton
@@ -201,6 +203,9 @@ fun ConversationScreen(
     onReadReceiptForEvent: (eventId: String) -> Unit,
     /** Bumps after each outbound send so the list jumps to the newest row. */
     scrollToLatestSignal: Int = 0,
+    jumpToEventId: String? = null,
+    onConsumeJumpToEvent: () -> Unit = {},
+    onJumpToReply: (String) -> Unit = {},
     pendingComposeReply: PendingComposeReply? = null,
     onClearComposeReply: () -> Unit = {},
     onReplyToMessage: (TimelineMessage) -> Unit = {},
@@ -252,6 +257,8 @@ fun ConversationScreen(
     }
 
     var allowScrollPersist by remember(roomId) { mutableStateOf(false) }
+    var highlightEventId by remember(roomId) { mutableStateOf<String?>(null) }
+    var unseenBelow by remember(roomId) { mutableStateOf(0) }
 
     LaunchedEffect(roomId) {
         allowScrollPersist = false
@@ -273,29 +280,56 @@ fun ConversationScreen(
         listState.scrollToItem(0, 0)
     }
 
-    // Pinned-at-bottom: ONLY auto-scroll when the user is already at the live edge.
-    // Keys are stable so prevHeadId / prevSize survive new-message emissions.
+    // reverseLayout puts new rows at index 0. Keep the same message on screen
+    // unless the user is already sitting on the latest one.
     LaunchedEffect(roomId, listState) {
         var prevHeadId: String? = null
         var prevSize = 0
+        var prevKey: String? = null
+        var prevOffset = 0
         snapshotFlow {
             val current = displayState.value
+            val first = listState.firstVisibleItemIndex
             HeadSizeOffset(
                 headId = current.firstOrNull()?.eventId?.value,
                 size = current.size,
-                firstIndex = listState.firstVisibleItemIndex,
+                firstIndex = first,
                 firstOffset = listState.firstVisibleItemScrollOffset,
+                visibleKey = current.getOrNull(first)?.eventId?.value,
             )
         }.collect { state ->
             val pinned = state.firstIndex == 0 && state.firstOffset <= 96
-            val grew = state.size > prevSize && state.headId != null
-            val headChanged = state.headId != null && state.headId != prevHeadId
-            if (prevHeadId != null && grew && headChanged && pinned) {
-                listState.scrollToItem(0, 0)
+            val added = state.size - prevSize
+            val grewAtHead = added > 0 && state.headId != null && state.headId != prevHeadId
+            if (prevHeadId != null && grewAtHead) {
+                if (pinned) {
+                    unseenBelow = 0
+                } else {
+                    val keep = prevKey
+                    val idx = displayState.value.indexOfFirst { it.eventId.value == keep }
+                    if (idx >= 0) {
+                        listState.scrollToItem(idx, prevOffset)
+                    }
+                    unseenBelow += added
+                }
             }
+            if (pinned) unseenBelow = 0
             prevHeadId = state.headId
             prevSize = state.size
+            prevKey = state.visibleKey
+            prevOffset = state.firstOffset
         }
+    }
+
+    LaunchedEffect(jumpToEventId, messages) {
+        val target = jumpToEventId ?: return@LaunchedEffect
+        val idx = displayState.value.indexOfFirst { it.eventId.value == target }
+        if (idx < 0) return@LaunchedEffect
+        listState.animateScrollToItem(idx, 0)
+        highlightEventId = target
+        onConsumeJumpToEvent()
+        delay(1600)
+        if (highlightEventId == target) highlightEventId = null
     }
 
     LaunchedEffect(roomId, allowScrollPersist, listState) {
@@ -380,6 +414,8 @@ fun ConversationScreen(
                             isFirstInGroup = !sameAsNewer,
                             isLastInGroup = !sameAsOlder,
                             onReplySwipe = onReplyToMessage,
+                            onJumpToReply = onJumpToReply,
+                            highlighted = highlightEventId == msg.eventId.value,
                             onOpenProfile = { profileMember = it },
                             onLongPress = { actionTarget = it },
                             onOpenMedia = { tapped ->
@@ -399,7 +435,8 @@ fun ConversationScreen(
 
                 val showJumpBottom by remember {
                     derivedStateOf {
-                        listState.firstVisibleItemIndex > 3 ||
+                        unseenBelow > 0 ||
+                            listState.firstVisibleItemIndex > 3 ||
                             listState.firstVisibleItemScrollOffset > 600
                     }
                 }
@@ -411,18 +448,27 @@ fun ConversationScreen(
                         .align(Alignment.BottomEnd)
                         .padding(end = 12.dp, bottom = 8.dp),
                 ) {
-                    SmallFloatingActionButton(
-                        onClick = {
-                            scope.launch {
-                                listState.animateScrollToItem(0, 0)
-                                keyboard?.hide()
-                                focusManager.clearFocus()
+                    BadgedBox(
+                        badge = {
+                            if (unseenBelow > 0) {
+                                Badge { Text(if (unseenBelow > 99) "99+" else unseenBelow.toString()) }
                             }
                         },
-                        containerColor = MaterialTheme.colorScheme.primaryContainer,
-                        contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
                     ) {
-                        Icon(Icons.Filled.KeyboardArrowDown, contentDescription = "Scroll to latest")
+                        SmallFloatingActionButton(
+                            onClick = {
+                                unseenBelow = 0
+                                scope.launch {
+                                    listState.animateScrollToItem(0, 0)
+                                    keyboard?.hide()
+                                    focusManager.clearFocus()
+                                }
+                            },
+                            containerColor = MaterialTheme.colorScheme.primaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                        ) {
+                            Icon(Icons.Filled.KeyboardArrowDown, contentDescription = "Scroll to latest")
+                        }
                     }
                 }
 
@@ -578,6 +624,7 @@ private data class HeadSizeOffset(
     val size: Int,
     val firstIndex: Int,
     val firstOffset: Int,
+    val visibleKey: String? = null,
 )
 
 @Composable
@@ -650,6 +697,7 @@ private fun ReplyQuoteStrip(
     bubbleColor: Color,
     bodyColor: Color,
     metaColor: Color,
+    onJumpToReply: (String) -> Unit = {},
 ) {
     if (message.replyToEventId == null) return
     val accent = if (message.replyToParentIsOwn) {
@@ -671,10 +719,19 @@ private fun ReplyQuoteStrip(
     val quoteBackground = bubbleColor.luminance().let { lum ->
         if (lum > 0.5f) Color.Black.copy(alpha = 0.06f) else Color.White.copy(alpha = 0.08f)
     }
+    val targetId = message.replyToEventId?.value
     Surface(
         shape = RoundedCornerShape(10.dp),
         color = quoteBackground,
-        modifier = Modifier.padding(bottom = 6.dp),
+        modifier = Modifier
+            .padding(bottom = 6.dp)
+            .then(
+                if (targetId.isNullOrBlank() || targetId.startsWith("txn:")) {
+                    Modifier
+                } else {
+                    Modifier.clickable { onJumpToReply(targetId) }
+                },
+            ),
     ) {
         Row(
             modifier = Modifier.height(IntrinsicSize.Min),
@@ -865,6 +922,8 @@ private fun MessageRow(
     isFirstInGroup: Boolean,
     isLastInGroup: Boolean,
     onReplySwipe: (TimelineMessage) -> Unit,
+    onJumpToReply: (String) -> Unit,
+    highlighted: Boolean,
     onOpenProfile: (RoomMemberBrief) -> Unit,
     onLongPress: (TimelineMessage) -> Unit,
     onOpenMedia: (TimelineMessage) -> Unit,
@@ -1077,6 +1136,13 @@ private fun MessageRow(
                         if (isOwn) Modifier.background(outgoingBrush) else Modifier.background(bubbleColor),
                     )
                     .then(
+                        if (highlighted) {
+                            Modifier.border(2.dp, scheme.tertiary, shape)
+                        } else {
+                            Modifier
+                        },
+                    )
+                    .then(
                         if (isOwn) {
                             Modifier
                         } else {
@@ -1107,6 +1173,7 @@ private fun MessageRow(
                     bubbleColor = bubbleColor,
                     bodyColor = bodyColor,
                     metaColor = metaColor,
+                    onJumpToReply = onJumpToReply,
                 )
                 MessageBubbleBody(
                     message = message,
