@@ -1,10 +1,19 @@
 package com.nextgenmatrix.app
 
+import android.Manifest
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
+import androidx.core.content.ContextCompat
+import androidx.core.net.toUri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -48,6 +57,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -84,18 +94,51 @@ import com.nextgenmatrix.feature.chat.ChatListViewModel
 import com.nextgenmatrix.feature.chat.ConversationRoute
 import com.nextgenmatrix.feature.chat.SpaceDetailRoute
 import com.nextgenmatrix.feature.chat.SpacesRoute
+import com.nextgenmatrix.data.push.PushCoordinator
 import com.nextgenmatrix.feature.settings.ProfileRoute
 import com.nextgenmatrix.feature.settings.SettingsRoute
 import dagger.hilt.android.AndroidEntryPoint
+import javax.inject.Inject
 
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
+    @Inject lateinit var pushCoordinator: PushCoordinator
+
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        offerRoomFromIntent(intent)
         setContent { AppRoot() }
     }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        offerRoomFromIntent(intent)
+    }
+
+    private fun offerRoomFromIntent(intent: Intent?) {
+        val target = roomTargetFromIntent(intent) ?: return
+        pushCoordinator.offerOpenRoom(target.roomId, target.eventId)
+    }
 }
+
+internal data class RoomOpenTarget(val roomId: String, val eventId: String? = null)
+
+internal fun roomTargetFromIntent(intent: Intent?): RoomOpenTarget? {
+    if (intent == null) return null
+    intent.getStringExtra("room_id")?.takeIf { it.isNotBlank() }?.let { roomId ->
+        val event = intent.getStringExtra("event_id")?.takeIf { it.isNotBlank() }
+        return RoomOpenTarget(roomId, event)
+    }
+    val data = intent.data ?: return null
+    if (data.scheme != "teletrix" || data.host != "room") return null
+    val encoded = data.pathSegments.firstOrNull() ?: return null
+    val event = data.getQueryParameter("event")?.takeIf { it.isNotBlank() }
+    return RoomOpenTarget(Uri.decode(encoded), event)
+}
+
+internal fun roomIdFromIntent(intent: Intent?): String? = roomTargetFromIntent(intent)?.roomId
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -108,7 +151,7 @@ private fun AppRoot() {
         AppThemeMode.Light -> false
         AppThemeMode.System -> isSystemInDarkTheme()
     }
-    val activity = LocalContext.current as ComponentActivity
+    val activity = LocalContext.current as MainActivity
     DisposableEffect(activity, dark) {
         val bars = if (dark) {
             SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
@@ -122,6 +165,34 @@ private fun AppRoot() {
     val sessionPrompt by sessionVerifyVm.prompt.collectAsStateWithLifecycle()
     val chatListVm: ChatListViewModel = hiltViewModel()
     val rooms by chatListVm.rooms.collectAsStateWithLifecycle()
+    val openRoomId by activity.pushCoordinator.openRoomId.collectAsStateWithLifecycle()
+    val openJump by activity.pushCoordinator.openJump.collectAsStateWithLifecycle()
+    val notifyPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { }
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= 33) {
+            val granted = ContextCompat.checkSelfPermission(
+                activity,
+                Manifest.permission.POST_NOTIFICATIONS,
+            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            if (!granted) notifyPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        val prefs = activity.getSharedPreferences("teletrix_push", android.content.Context.MODE_PRIVATE)
+        if (!prefs.getBoolean("asked_battery", false) &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+        ) {
+            prefs.edit().putBoolean("asked_battery", true).apply()
+            runCatching {
+                activity.startActivity(
+                    Intent(
+                        Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        "package:${activity.packageName}".toUri(),
+                    ),
+                )
+            }
+        }
+    }
     val musicVm: MusicPlayerViewModel = hiltViewModel()
     val nowPlaying by musicVm.nowPlaying.collectAsStateWithLifecycle()
 
@@ -131,6 +202,14 @@ private fun AppRoot() {
             val scheme = MaterialTheme.colorScheme
             val backStackEntry by navController.currentBackStackEntryAsState()
             val route = backStackEntry?.destination?.route.orEmpty()
+            LaunchedEffect(openRoomId, route) {
+                val dest = openRoomId ?: return@LaunchedEffect
+                if (route == "auth" || route.isEmpty()) return@LaunchedEffect
+                navController.navigate("room/$dest") {
+                    launchSingleTop = true
+                }
+                activity.pushCoordinator.consumeOpenRoom()
+            }
             val showTopBar = route != "auth"
             val inRoom = route.startsWith("room/") || route.startsWith("room/{")
             val inSpace = route.startsWith("space/")
@@ -230,9 +309,11 @@ private fun AppRoot() {
                         composable("auth") {
                             AuthRoute(
                                 onLoggedIn = {
-                                    navController.navigate("chats") {
+                                    val dest = openRoomId?.let { "room/$it" } ?: "chats"
+                                    navController.navigate(dest) {
                                         popUpTo("auth") { inclusive = true }
                                     }
+                                    if (openRoomId != null) activity.pushCoordinator.consumeOpenRoom()
                                 },
                             )
                         }
@@ -268,14 +349,22 @@ private fun AppRoot() {
                             arguments = listOf(navArgument("roomId") { type = NavType.StringType }),
                         ) { entry ->
                             val id = entry.arguments?.getString("roomId")!!
-                            ConversationRoute(roomId = id)
+                            ConversationRoute(
+                                roomId = id,
+                                initialJumpEventId = openJump?.takeIf { it.roomId == id }?.eventId,
+                                onJumpFromNotification = activity.pushCoordinator::consumeOpenEvent,
+                            )
                         }
                         composable("settings") {
+                            val notifyVm: NotificationSettingsViewModel = hiltViewModel()
+                            val notifyPrefs by notifyVm.prefs.collectAsStateWithLifecycle()
                             SettingsRoute(
                                 themeMode = themeMode,
                                 onThemeMode = appearanceVm::setThemeMode,
                                 contrastMode = contrast,
                                 onContrastMode = appearanceVm::setContrastMode,
+                                notifyPrefs = notifyPrefs,
+                                onNotifyPrefs = notifyVm::update,
                                 onVerifySession = { sessionVerifyVm.requestVerification() },
                             )
                         }

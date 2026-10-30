@@ -8,6 +8,9 @@ import com.nextgenmatrix.core.model.AccountSummary
 import com.nextgenmatrix.core.model.DirectoryEntry
 import com.nextgenmatrix.core.model.DirectoryPage
 import com.nextgenmatrix.core.model.HomeserverLoginDetails
+import com.nextgenmatrix.core.model.ChatNotifyMode
+import com.nextgenmatrix.core.model.IncomingNotification
+import com.nextgenmatrix.core.model.NotificationPrefs
 import com.nextgenmatrix.core.model.MatrixRoomId
 import com.nextgenmatrix.core.model.MentionTag
 import com.nextgenmatrix.core.model.RoomMemberBrief
@@ -30,8 +33,11 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
@@ -82,6 +88,19 @@ import org.matrix.rustcomponents.sdk.ProgressWatcher
 import org.matrix.rustcomponents.sdk.ReceiptType
 import org.matrix.rustcomponents.sdk.SlidingSyncVersionBuilder
 import org.matrix.rustcomponents.sdk.SqliteStoreBuilder as SdkSqliteStoreBuilder
+import org.matrix.rustcomponents.sdk.Action
+import org.matrix.rustcomponents.sdk.HttpPusherData
+import org.matrix.rustcomponents.sdk.PushCondition
+import org.matrix.rustcomponents.sdk.RoomNotificationMode
+import org.matrix.rustcomponents.sdk.RuleKind
+import org.matrix.rustcomponents.sdk.NotificationEvent
+import org.matrix.rustcomponents.sdk.NotificationItem
+import org.matrix.rustcomponents.sdk.NotificationProcessSetup
+import org.matrix.rustcomponents.sdk.NotificationStatus
+import org.matrix.rustcomponents.sdk.PushFormat
+import org.matrix.rustcomponents.sdk.PusherIdentifiers
+import org.matrix.rustcomponents.sdk.PusherKind
+import org.matrix.rustcomponents.sdk.SyncNotificationListener
 import org.matrix.rustcomponents.sdk.Timeline
 import org.matrix.rustcomponents.sdk.TimelineDiff
 import org.matrix.rustcomponents.sdk.TimelineItem
@@ -134,7 +153,29 @@ interface MatrixRepository {
     suspend fun sendAttachment(roomId: MatrixRoomId, bytes: ByteArray, fileName: String, mimeType: String)
     /** Uploads bytes and sends them as an `m.sticker` event. */
     suspend fun sendSticker(roomId: MatrixRoomId, bytes: ByteArray, fileName: String, mimeType: String)
-    suspend fun paginateBack(roomId: MatrixRoomId)
+    suspend fun paginateBack(roomId: MatrixRoomId): Boolean
+
+    /**
+     * Loads older pages until [eventId] is in the open timeline, or history runs out.
+     * The conversation must already be observing [roomId].
+     */
+    suspend fun ensureEventInTimeline(roomId: MatrixRoomId, eventId: String): Boolean
+
+    val incomingNotifications: SharedFlow<IncomingNotification>
+
+    /** Room the user is looking at; notifications for it are suppressed. */
+    fun setActiveConversation(roomId: String?)
+
+    suspend fun registerHttpPusher(pushkey: String)
+
+    suspend fun unregisterHttpPusher()
+
+    /** Fetch and decrypt one event for a push payload. Restores the session if needed. */
+    suspend fun notificationForEvent(roomId: String, eventId: String): IncomingNotification?
+
+    fun setNotificationPrefs(prefs: NotificationPrefs)
+
+    suspend fun applyNotificationPrefs()
 
     suspend fun approveSessionVerification()
     suspend fun declineSessionVerification()
@@ -242,6 +283,20 @@ class DefaultMatrixRepository @Inject constructor(
         _sessionVerificationPrompt.asStateFlow()
 
     private var roomPollJob: Job? = null
+
+    private val _incomingNotifications = MutableSharedFlow<IncomingNotification>(extraBufferCapacity = 64)
+    override val incomingNotifications: SharedFlow<IncomingNotification> = _incomingNotifications.asSharedFlow()
+
+    @Volatile
+    private var activeConversationRoomId: String? = null
+
+    @Volatile
+    private var registeredPushkey: String? = null
+
+    @Volatile
+    private var notificationPrefs: NotificationPrefs = NotificationPrefs()
+
+    private val pusherAppId = "com.nextgenmatrix.app.android"
 
     @Volatile
     private var sessionVerificationController: SessionVerificationController? = null
@@ -516,6 +571,7 @@ class DefaultMatrixRepository @Inject constructor(
 
     override suspend fun logout() =
         withContext(dispatchers.io) {
+            runCatching { unregisterHttpPusher() }
             val paths = mutex.withLock {
                 runCatching { client?.logout() }
                 val paths = sessionPaths
@@ -528,6 +584,8 @@ class DefaultMatrixRepository @Inject constructor(
                 _roomMembers.value = emptyMap()
                 unreadHolds.clear()
                 unreadHoldsLoaded = false
+                activeConversationRoomId = null
+                registeredPushkey = null
                 paths
             }
             runCatching { paths?.root?.deleteRecursively() }
@@ -700,11 +758,338 @@ class DefaultMatrixRepository @Inject constructor(
         }
     }
 
-    override suspend fun paginateBack(roomId: MatrixRoomId) {
+    override suspend fun paginateBack(roomId: MatrixRoomId): Boolean =
         withContext(dispatchers.io) {
-            if (activeTimelineRoomId != roomId.value) return@withContext
-            activeTimeline?.paginateBackwards(50u)
+            if (activeTimelineRoomId != roomId.value) return@withContext false
+            runCatching { activeTimeline?.paginateBackwards(50u) }.getOrNull() == true
         }
+
+    override suspend fun ensureEventInTimeline(roomId: MatrixRoomId, eventId: String): Boolean =
+        withContext(dispatchers.io) {
+            val target = eventId.trim()
+            if (target.isEmpty() || target.startsWith("txn:")) return@withContext false
+            if (timelineContains(roomId.value, target)) return@withContext true
+            repeat(20) {
+                val more = paginateBack(roomId)
+                if (timelineContains(roomId.value, target)) return@withContext true
+                if (!more) return@withContext false
+            }
+            timelineContains(roomId.value, target)
+        }
+
+    private fun timelineContains(roomId: String, eventId: String): Boolean =
+        _timeline.value[roomId].orEmpty().any { it.eventId.value == eventId }
+
+    override fun setActiveConversation(roomId: String?) {
+        activeConversationRoomId = roomId
+    }
+
+    override suspend fun registerHttpPusher(pushkey: String) =
+        withContext(dispatchers.io) {
+            val key = pushkey.trim()
+            if (key.isEmpty()) return@withContext
+            val c = mutex.withLock { client } ?: return@withContext
+            val ids = PusherIdentifiers(key, pusherAppId)
+            val data = HttpPusherData(
+                "https://matrix.gateway.unifiedpush.org/_matrix/push/v1/notify",
+                PushFormat.EVENT_ID_ONLY,
+                "{}",
+            )
+            val kind = PusherKind.Http(data)
+            c.setPusher(
+                identifiers = ids,
+                kind = kind,
+                appDisplayName = "Teletrix",
+                deviceDisplayName = "Teletrix",
+                profileTag = null,
+                lang = "en",
+            )
+            registeredPushkey = key
+        }
+
+    override suspend fun unregisterHttpPusher() =
+        withContext(dispatchers.io) {
+            val key = registeredPushkey ?: return@withContext
+            val c = mutex.withLock { client } ?: return@withContext
+            val ids = PusherIdentifiers(key, pusherAppId)
+            runCatching { c.deletePusher(ids) }
+            registeredPushkey = null
+        }
+
+    override suspend fun notificationForEvent(roomId: String, eventId: String): IncomingNotification? =
+        withContext(dispatchers.io) {
+            if (!ensureClientReady()) return@withContext null
+            val (c, sync) = mutex.withLock {
+                val cc = client
+                val ss = syncService
+                if (cc == null || ss == null) null else cc to ss
+            } ?: return@withContext null
+            val setup = NotificationProcessSetup.SingleProcess(sync)
+            val nc = try {
+                c.notificationClient(setup)
+            } finally {
+                runCatching { setup.destroy() }
+            }
+            try {
+                when (val status = nc.getNotification(roomId, eventId)) {
+                    is NotificationStatus.Event -> {
+                        val item = status.item
+                        try {
+                            mapNotificationItem(item, roomId, c.userId())
+                        } finally {
+                            runCatching { item.destroy() }
+                        }
+                    }
+                    is NotificationStatus.EventFilteredOut ->
+                        loadReactionNotification(roomId, eventId, c.userId())
+                    else ->
+                        loadReactionNotification(roomId, eventId, c.userId())
+                }
+            } finally {
+                runCatching { nc.destroy() }
+            }
+        }
+
+    private suspend fun ensureClientReady(): Boolean {
+        if (mutex.withLock { client } != null && _isLoggedIn.value) return true
+        return restoreSession().isSuccess && _isLoggedIn.value
+    }
+
+    private suspend fun mapNotificationItem(
+        item: NotificationItem,
+        roomId: String,
+        ownUserId: String,
+    ): IncomingNotification? {
+        if (roomId == activeConversationRoomId) return null
+        val senderId = when (val ev = item.event) {
+            is NotificationEvent.Timeline -> ev.event.senderId()
+            is NotificationEvent.Invite -> ev.sender
+            else -> return null
+        }
+        if (senderId == ownUserId) return null
+        val isInvite = item.event is NotificationEvent.Invite
+        val reaction = parseReaction(item.rawEvent)
+        val sender = item.senderInfo.displayName?.takeIf { it.isNotBlank() }
+            ?: senderId.substringAfter("@").substringBefore(":").ifBlank { senderId }
+        val roomTitle = item.roomInfo.displayName?.takeIf { it.isNotBlank() } ?: roomId
+        val eventId = when (val ev = item.event) {
+            is NotificationEvent.Timeline -> ev.event.eventId()
+            else -> ""
+        }
+        val body = when {
+            isInvite -> "Invited you to a room"
+            reaction != null -> "$sender reacted ${reaction.key}"
+            else -> bodyFromRawEvent(item.rawEvent)
+        }
+        val mapped = IncomingNotification(
+            roomId = roomId,
+            eventId = eventId,
+            roomTitle = roomTitle,
+            senderName = sender,
+            body = body,
+            isDirect = item.roomInfo.isDirect || item.roomInfo.isDm,
+            isInvite = isInvite,
+            noisy = item.isNoisy != false,
+            hasMention = item.hasMention == true || mentionsOwnUser(item.rawEvent, ownUserId),
+            isReaction = reaction != null,
+            jumpEventId = reaction?.eventId,
+            reactionKey = reaction?.key,
+        )
+        return if (shouldNotify(mapped, ownUserId, reaction?.eventId, roomId)) mapped else null
+    }
+
+    private fun bodyFromRawEvent(raw: String?): String {
+        if (raw.isNullOrBlank()) return "New message"
+        return runCatching {
+            val content = JSONObject(raw).optJSONObject("content") ?: return@runCatching "New message"
+            val type = content.optString("msgtype")
+            val body = content.optString("body").trim()
+            when {
+                type == "m.image" -> "Photo"
+                type == "m.video" -> "Video"
+                type == "m.audio" -> if (content.optJSONObject("info")?.optString("org.matrix.msc3245.voice") != null ||
+                    content.has("org.matrix.msc3245.voice")
+                ) {
+                    "Voice message"
+                } else {
+                    "Audio"
+                }
+                type == "m.sticker" || raw.contains("\"m.sticker\"") -> "Sticker"
+                type == "m.file" -> "File"
+                body.isNotBlank() -> body.lines().first().take(180)
+                else -> "New message"
+            }
+        }.getOrDefault("New message")
+    }
+
+    private fun emitIncoming(item: IncomingNotification) {
+        if (item.roomId == activeConversationRoomId) return
+        if (item.jumpEventId == null && item.isReaction) return
+        _incomingNotifications.tryEmit(item)
+    }
+
+    override fun setNotificationPrefs(prefs: NotificationPrefs) {
+        notificationPrefs = prefs
+    }
+
+    override suspend fun applyNotificationPrefs() =
+        withContext(dispatchers.io) {
+            val c = mutex.withLock { client } ?: return@withContext
+            val prefs = notificationPrefs
+            val settings = try {
+                c.getNotificationSettings()
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                return@withContext
+            }
+            try {
+                val dmMode = if (!prefs.enabled) ChatNotifyMode.Off else prefs.privateChats
+                val groupMode = if (!prefs.enabled) ChatNotifyMode.Off else prefs.groups
+                listOf(false, true).forEach { encrypted ->
+                    try {
+                        settings.setDefaultRoomNotificationMode(encrypted, true, toSdkMode(dmMode))
+                    } catch (t: Throwable) {
+                        if (t is CancellationException) throw t
+                    }
+                    try {
+                        settings.setDefaultRoomNotificationMode(encrypted, false, toSdkMode(groupMode))
+                    } catch (t: Throwable) {
+                        if (t is CancellationException) throw t
+                    }
+                }
+                try {
+                    settings.setUserMentionEnabled(prefs.enabled)
+                } catch (t: Throwable) {
+                    if (t is CancellationException) throw t
+                }
+                try {
+                    settings.setRoomMentionEnabled(prefs.enabled)
+                } catch (t: Throwable) {
+                    if (t is CancellationException) throw t
+                }
+                if (prefs.enabled && prefs.reactions) {
+                    try {
+                        settings.setCustomPushRule(
+                            REACTION_RULE_ID,
+                            RuleKind.Override,
+                            listOf(Action.Notify),
+                            listOf(PushCondition.EventMatch("type", "m.reaction")),
+                        )
+                    } catch (t: Throwable) {
+                        if (t is CancellationException) throw t
+                    }
+                }
+            } finally {
+                runCatching { settings.destroy() }
+            }
+        }
+
+    private fun toSdkMode(mode: ChatNotifyMode): RoomNotificationMode = when (mode) {
+        ChatNotifyMode.All -> RoomNotificationMode.ALL_MESSAGES
+        ChatNotifyMode.Mentions -> RoomNotificationMode.MENTIONS_AND_KEYWORDS_ONLY
+        ChatNotifyMode.Off -> RoomNotificationMode.MUTE
+    }
+
+    private suspend fun shouldNotify(
+        item: IncomingNotification,
+        ownUserId: String,
+        reactionTargetId: String?,
+        roomId: String,
+    ): Boolean {
+        val prefs = notificationPrefs
+        if (!prefs.enabled) return false
+        if (item.roomId == activeConversationRoomId) return false
+        if (item.isInvite) return true
+        if (item.isReaction) {
+            if (!prefs.reactions || reactionTargetId.isNullOrBlank()) return false
+            return reactionTargetsOwnMessage(roomId, reactionTargetId, ownUserId)
+        }
+        val mode = if (item.isDirect) prefs.privateChats else prefs.groups
+        return when (mode) {
+            ChatNotifyMode.All -> true
+            ChatNotifyMode.Mentions -> item.hasMention
+            ChatNotifyMode.Off -> false
+        }
+    }
+
+    private suspend fun reactionTargetsOwnMessage(roomId: String, eventId: String, ownUserId: String): Boolean {
+        val room = mutex.withLock { client?.getRoom(roomId) } ?: return false
+        return runCatching {
+            val ev = room.loadOrFetchEvent(eventId)
+            try {
+                ev.senderId() == ownUserId
+            } finally {
+                runCatching { ev.destroy() }
+            }
+        }.getOrDefault(false)
+    }
+
+    private suspend fun loadReactionNotification(
+        roomId: String,
+        eventId: String,
+        ownUserId: String,
+    ): IncomingNotification? {
+        val room = mutex.withLock { client?.getRoom(roomId) } ?: return null
+        val ev = runCatching { room.loadOrFetchEvent(eventId) }.getOrNull() ?: return null
+        return try {
+            val raw = runCatching { ev.content() }.getOrNull()
+            val reaction = parseReactionFromRelated(ev, raw) ?: return null
+            if (ev.senderId() == ownUserId) return null
+            if (!notificationPrefs.enabled || !notificationPrefs.reactions) return null
+            if (!reactionTargetsOwnMessage(roomId, reaction.eventId, ownUserId)) return null
+            val sender = ev.senderId().substringAfter("@").substringBefore(":")
+            val summary = _rooms.value.firstOrNull { it.roomId.value == roomId }
+            IncomingNotification(
+                roomId = roomId,
+                eventId = ev.eventId(),
+                roomTitle = summary?.title ?: roomId,
+                senderName = sender,
+                body = "$sender reacted ${reaction.key}",
+                isDirect = summary?.presentationKind == RoomPresentationKind.DirectMessage,
+                isReaction = true,
+                jumpEventId = reaction.eventId,
+                reactionKey = reaction.key,
+            )
+        } finally {
+            runCatching { ev.destroy() }
+        }
+    }
+
+    private data class ReactionRef(val eventId: String, val key: String)
+
+    private fun parseReaction(raw: String?): ReactionRef? {
+        if (raw.isNullOrBlank()) return null
+        return runCatching {
+            val obj = JSONObject(raw)
+            val type = obj.optString("type")
+            val content = obj.optJSONObject("content") ?: obj
+            val relates = content.optJSONObject("m.relates_to") ?: return@runCatching null
+            if (type.isNotBlank() && type != "m.reaction" &&
+                relates.optString("rel_type") != "m.annotation"
+            ) {
+                return@runCatching null
+            }
+            val target = relates.optString("event_id")
+            val key = relates.optString("key").ifBlank { "❤" }
+            if (target.isBlank()) null else ReactionRef(target, key)
+        }.getOrNull()
+    }
+
+    private fun parseReactionFromRelated(
+        ev: org.matrix.rustcomponents.sdk.TimelineEvent,
+        content: org.matrix.rustcomponents.sdk.TimelineEventContent?,
+    ): ReactionRef? {
+        try {
+            val related = (content as? org.matrix.rustcomponents.sdk.TimelineEventContent.MessageLike)
+                ?.content as? org.matrix.rustcomponents.sdk.MessageLikeEventContent.ReactionContent
+            if (related != null) {
+                return ReactionRef(related.relatedEventId, "❤")
+            }
+        } catch (_: Throwable) {
+        } finally {
+            runCatching { content?.destroy() }
+        }
+        return null
     }
 
     override suspend fun loadMatrixMediaThumbnail(
@@ -1361,6 +1746,25 @@ class DefaultMatrixRepository @Inject constructor(
         startRoomPollingLocked()
         runCatching { refreshAccount() }
         runCatching { ensureSessionVerificationController(c) }
+        runCatching { attachSyncNotifications(c) }
+        runCatching { applyNotificationPrefs() }
+    }
+
+    private suspend fun attachSyncNotifications(c: Client) {
+        c.registerNotificationHandler(
+            object : SyncNotificationListener {
+                override fun onNotification(notification: NotificationItem, roomId: String) {
+                    scope.launch {
+                        try {
+                            val own = runCatching { c.userId() }.getOrNull() ?: return@launch
+                            mapNotificationItem(notification, roomId, own)?.let(::emitIncoming)
+                        } finally {
+                            runCatching { notification.destroy() }
+                        }
+                    }
+                }
+            },
+        )
     }
 
     private fun startRoomPollingLocked() {
@@ -1980,8 +2384,31 @@ class DefaultMatrixRepository @Inject constructor(
         val cache: File,
     )
 
+    private fun mentionsOwnUser(raw: String?, ownUserId: String): Boolean {
+        if (raw.isNullOrBlank() || ownUserId.isBlank()) return false
+        return runCatching {
+            val obj = JSONObject(raw)
+            val content = obj.optJSONObject("content") ?: return@runCatching false
+            val mentions = content.optJSONObject("m.mentions")
+            if (mentions?.optBoolean("room") == true) return@runCatching true
+            val users = mentions?.optJSONArray("user_ids")
+            if (users != null) {
+                for (i in 0 until users.length()) {
+                    if (users.optString(i) == ownUserId) return@runCatching true
+                }
+            }
+            val local = ownUserId.substringAfter("@").substringBefore(":")
+            val body = content.optString("body")
+            val formatted = content.optJSONObject("formatted_body")?.toString()
+                ?: content.optString("formatted_body")
+            ownUserId in body || "@$local" in body ||
+                (!formatted.isNullOrBlank() && (ownUserId in formatted || "@$local" in formatted))
+        }.getOrDefault(false)
+    }
+
     private companion object {
         const val VERIFY_LOG = "NgVerify"
+        const val REACTION_RULE_ID = "com.nextgenmatrix.app.reaction"
 
         /** How long to let the other client send its SAS start before we send ours. */
         const val SAS_START_GRACE_MS = 4_000L

@@ -19,7 +19,10 @@ android {
 dependencies {
     implementation(project(":core:common"))
     implementation(project(":core:model"))
+    implementation(project(":matrix"))
     implementation(libs.androidx.core.ktx)
+    implementation(libs.okhttp)
+    implementation(libs.coroutines.android)
     implementation(libs.unifiedpush.connector) {
         exclude(group = "com.google.crypto.tink", module = "tink")
     }

@@ -145,6 +145,35 @@ data class PusherConfig(
     val deviceToken: String,
 )
 
+enum class ChatNotifyMode {
+    All,
+    Mentions,
+    Off,
+}
+
+data class NotificationPrefs(
+    val enabled: Boolean = true,
+    val privateChats: ChatNotifyMode = ChatNotifyMode.All,
+    val groups: ChatNotifyMode = ChatNotifyMode.Mentions,
+    val reactions: Boolean = true,
+)
+
+/** A message the homeserver wants shown as a system notification. */
+data class IncomingNotification(
+    val roomId: String,
+    val eventId: String,
+    val roomTitle: String,
+    val senderName: String,
+    val body: String,
+    val isDirect: Boolean,
+    val isInvite: Boolean = false,
+    val noisy: Boolean = true,
+    val hasMention: Boolean = false,
+    val isReaction: Boolean = false,
+    val jumpEventId: String? = null,
+    val reactionKey: String? = null,
+)
+
 data class ModerationCapabilities(
     val canChangePowerLevels: Boolean,
     val canKick: Boolean,

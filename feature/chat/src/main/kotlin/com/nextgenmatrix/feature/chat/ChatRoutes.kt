@@ -446,17 +446,25 @@ private fun formatLastActivity(ms: Long?): String? {
 fun ConversationRoute(
     roomId: String,
     modifier: Modifier = Modifier,
+    initialJumpEventId: String? = null,
+    onJumpFromNotification: () -> Unit = {},
     viewModel: ConversationViewModel = hiltViewModel(),
 ) {
     LaunchedEffect(roomId) {
         viewModel.bindRoom(roomId)
         viewModel.loadDraft(roomId)
     }
+    LaunchedEffect(roomId, initialJumpEventId) {
+        val target = initialJumpEventId?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
+        viewModel.jumpToReply(target)
+        onJumpFromNotification()
+    }
     val timeline by viewModel.messages.collectAsStateWithLifecycle()
     val items = timeline[roomId].orEmpty()
     val draft by viewModel.draft.collectAsStateWithLifecycle()
     val scrollRestoreEventId by viewModel.scrollRestoreEventId.collectAsStateWithLifecycle()
     val scrollToLatestSignal by viewModel.scrollToLatestSignal.collectAsStateWithLifecycle()
+    val jumpToEventId by viewModel.jumpToEventId.collectAsStateWithLifecycle()
     val pendingComposeReply by viewModel.pendingReply.collectAsStateWithLifecycle()
     val nowPlaying by viewModel.nowPlaying.collectAsStateWithLifecycle()
     val preparingTrackId by viewModel.preparingTrackId.collectAsStateWithLifecycle()
@@ -506,6 +514,9 @@ fun ConversationRoute(
         onPersistScrollAnchor = { eventId -> viewModel.persistScrollAnchor(roomId, eventId) },
         onReadReceiptForEvent = { eventId -> viewModel.updateRoomReadReceipts(roomId, eventId) },
         scrollToLatestSignal = scrollToLatestSignal,
+        jumpToEventId = jumpToEventId,
+        onConsumeJumpToEvent = viewModel::consumeJumpToEvent,
+        onJumpToReply = viewModel::jumpToReply,
         pendingComposeReply = pendingComposeReply,
         onClearComposeReply = viewModel::clearComposeReply,
         onReplyToMessage = viewModel::setComposeReply,

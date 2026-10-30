@@ -74,6 +74,9 @@ class ConversationViewModel @Inject constructor(
     private val _scrollToLatestSignal = MutableStateFlow(0)
     val scrollToLatestSignal: StateFlow<Int> = _scrollToLatestSignal.asStateFlow()
 
+    private val _jumpToEventId = MutableStateFlow<String?>(null)
+    val jumpToEventId: StateFlow<String?> = _jumpToEventId.asStateFlow()
+
     private val _pendingReply = MutableStateFlow<PendingComposeReply?>(null)
     val pendingReply: StateFlow<PendingComposeReply?> = _pendingReply.asStateFlow()
 
@@ -99,8 +102,10 @@ class ConversationViewModel @Inject constructor(
     fun bindRoom(id: String) {
         val roomChanged = _roomId.value != id
         _roomId.value = id
+        matrixRepository.setActiveConversation(id)
         if (roomChanged) {
             _pendingReply.value = null
+            _jumpToEventId.value = null
             pickedMentions.clear()
         }
         viewModelScope.launch {
@@ -109,6 +114,26 @@ class ConversationViewModel @Inject constructor(
                 matrixRepository.observeTimeline(MatrixRoomId(id))
             }
         }
+    }
+
+    override fun onCleared() {
+        matrixRepository.setActiveConversation(null)
+        super.onCleared()
+    }
+
+    fun jumpToReply(eventId: String) {
+        val target = eventId.trim()
+        if (target.isEmpty() || target.startsWith("txn:")) return
+        val room = _roomId.value ?: return
+        viewModelScope.launch {
+            if (matrixRepository.ensureEventInTimeline(MatrixRoomId(room), target)) {
+                _jumpToEventId.value = target
+            }
+        }
+    }
+
+    fun consumeJumpToEvent() {
+        _jumpToEventId.value = null
     }
 
     fun consumeScrollRestore() {
