@@ -35,6 +35,11 @@ class NextGenPlaybackService : MediaSessionService() {
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
 
+    override fun onTaskRemoved(rootIntent: android.content.Intent?) {
+        val playing = mediaSession?.player?.let { it.isPlaying || it.playWhenReady } == true
+        if (!playing) stopSelf()
+    }
+
     override fun onDestroy() {
         mediaSession?.run {
             player.release()

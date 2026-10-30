@@ -87,8 +87,16 @@ internal object TimelineMessageMapper {
             mediaFileName = payload.fileName,
             mediaSizeBytes = payload.sizeBytes,
             threadRootEventId = threadRoot,
+            latestForeignReactionMs = latestForeignReactionMs(msgLike, ownUserId),
         )
     }
+
+    private fun latestForeignReactionMs(msgLike: MsgLikeContent, ownUserId: String): Long? =
+        msgLike.reactions
+            .asSequence()
+            .flatMap { it.senders }
+            .filter { it.senderId != ownUserId }
+            .maxOfOrNull { it.timestamp.toLong() }
 
     private data class Payload(
         val body: String,

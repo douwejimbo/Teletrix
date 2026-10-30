@@ -7,15 +7,21 @@ data class MusicTrack(
     val id: String,
     val title: String,
     val uri: Uri,
+    val subtitle: String? = null,
+    val isVoice: Boolean = false,
 )
 
 data class NowPlaying(
     val trackId: String,
     val title: String,
     val isPlaying: Boolean,
+    val positionMs: Long = 0,
+    val durationMs: Long = 0,
+    val subtitle: String? = null,
+    val isVoice: Boolean = false,
 )
 
-/** Background playback for audio files shared in chats. Voice notes stay inline. */
+/** Background playback for chat audio and voice notes. Survives leaving the room. */
 interface ChatMusicPlayer {
     val nowPlaying: StateFlow<NowPlaying?>
 
@@ -29,4 +35,8 @@ interface ChatMusicPlayer {
     fun next()
 
     fun previous()
+
+    fun seekTo(positionMs: Long)
+
+    fun stop()
 }

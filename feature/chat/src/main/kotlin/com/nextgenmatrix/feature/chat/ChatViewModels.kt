@@ -21,6 +21,7 @@ import com.nextgenmatrix.matrix.MatrixRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -53,6 +54,7 @@ class ConversationViewModel @Inject constructor(
     private val chatDraftDao: ChatDraftDao,
     private val chatScrollStateDao: ChatScrollStateDao,
     private val musicPlayer: ChatMusicPlayer,
+    private val attentionMarks: AttentionMarks,
 ) : ViewModel() {
 
     private val _roomId = MutableStateFlow<String?>(null)
@@ -79,6 +81,14 @@ class ConversationViewModel @Inject constructor(
 
     private val _pendingReply = MutableStateFlow<PendingComposeReply?>(null)
     val pendingReply: StateFlow<PendingComposeReply?> = _pendingReply.asStateFlow()
+
+    private val _mentionWatermarkMs = MutableStateFlow(-1L)
+    val mentionWatermarkMs: StateFlow<Long> = _mentionWatermarkMs.asStateFlow()
+
+    private val _reactionWatermarkMs = MutableStateFlow(-1L)
+    val reactionWatermarkMs: StateFlow<Long> = _reactionWatermarkMs.asStateFlow()
+
+    private var attentionJob: Job? = null
 
     fun setComposeReply(message: TimelineMessage) {
         val eid = message.eventId.value
@@ -114,6 +124,45 @@ class ConversationViewModel @Inject constructor(
                 matrixRepository.observeTimeline(MatrixRoomId(id))
             }
         }
+        val hasUnreadMentions = matrixRepository.roomSummaries.value
+            .firstOrNull { it.roomId.value == id }
+            ?.mentionCount
+            ?.let { it > 0 } == true
+        attentionMarks.ensureMentionWatermark(id, hasUnreadMentions)
+        attentionMarks.ensureReactionWatermark(id)
+        _mentionWatermarkMs.value = attentionMarks.mentionWatermark(id)
+        _reactionWatermarkMs.value = attentionMarks.reactionWatermark(id)
+        attentionJob?.cancel()
+        attentionJob = viewModelScope.launch {
+            messages.collect { map ->
+                refineMentionWatermark(id, map[id].orEmpty())
+            }
+        }
+    }
+
+    private fun refineMentionWatermark(roomId: String, list: List<TimelineMessage>) {
+        if (_mentionWatermarkMs.value != 0L) return
+        val count = matrixRepository.roomSummaries.value
+            .firstOrNull { it.roomId.value == roomId }
+            ?.mentionCount ?: 0
+        if (count <= 0) {
+            markMentionRead(System.currentTimeMillis())
+            return
+        }
+        val mentions = list.filter { it.mentionsMe && !it.isOwn }
+            .sortedByDescending { it.timestampMs }
+        val oldestUnread = mentions.take(count).minOfOrNull { it.timestampMs } ?: return
+        _mentionWatermarkMs.value = attentionMarks.raiseMentionWatermark(roomId, oldestUnread - 1)
+    }
+
+    fun markMentionRead(timestampMs: Long) {
+        val room = _roomId.value ?: return
+        _mentionWatermarkMs.value = attentionMarks.raiseMentionWatermark(room, timestampMs)
+    }
+
+    fun markReactionRead(timestampMs: Long) {
+        val room = _roomId.value ?: return
+        _reactionWatermarkMs.value = attentionMarks.raiseReactionWatermark(room, timestampMs)
     }
 
     override fun onCleared() {
@@ -197,7 +246,7 @@ class ConversationViewModel @Inject constructor(
     }
 
     fun onPlayChatAudio(message: TimelineMessage) {
-        if (message.isVoiceMessage || message.contentKind != TimelineContentKind.Audio) return
+        if (message.contentKind != TimelineContentKind.Audio) return
         val now = musicPlayer.nowPlaying.value
         if (now?.trackId == message.eventId.value) {
             musicPlayer.toggle()
@@ -214,7 +263,10 @@ class ConversationViewModel @Inject constructor(
             }
             musicPlayer.play(listOf(selected), 0)
             _preparingTrackId.value = null
-            val audio = snapshot.filter { it.contentKind == TimelineContentKind.Audio && !it.isVoiceMessage }
+            val voice = message.isVoiceMessage
+            val audio = snapshot.filter {
+                it.contentKind == TimelineContentKind.Audio && it.isVoiceMessage == voice
+            }
             val tracks = withContext(Dispatchers.IO) {
                 audio.mapNotNull { msg ->
                     if (msg.eventId.value == message.eventId.value) selected else loadTrack(msg)
@@ -234,10 +286,19 @@ class ConversationViewModel @Inject constructor(
         val file = File(appContext.cacheDir, "music/$safe.${audioExtension(bytes)}")
         file.parentFile?.mkdirs()
         file.writeBytes(bytes)
+        val roomTitle = _roomId.value?.let { id ->
+            matrixRepository.roomSummaries.value.firstOrNull { it.roomId.value == id }?.title
+        }
         return MusicTrack(
             id = message.eventId.value,
-            title = message.body.ifBlank { "Audio" },
+            title = if (message.isVoiceMessage) {
+                "Voice message"
+            } else {
+                message.mediaFileName?.takeIf { it.isNotBlank() } ?: message.body.ifBlank { "Audio" }
+            },
             uri = Uri.fromFile(file),
+            subtitle = roomTitle,
+            isVoice = message.isVoiceMessage,
         )
     }
 

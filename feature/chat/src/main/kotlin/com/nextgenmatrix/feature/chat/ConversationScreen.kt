@@ -85,14 +85,12 @@ import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Keyboard
 import androidx.compose.material.icons.outlined.Mood
-import androidx.compose.material.icons.outlined.Notifications
 import androidx.compose.material.icons.outlined.Videocam
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
@@ -152,11 +150,6 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
-import androidx.media3.common.MediaItem
-import androidx.media3.common.Player
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.ui.PlayerView
 import coil3.compose.AsyncImage
 import com.nextgenmatrix.core.model.RoomMemberBrief
 import com.nextgenmatrix.core.model.TimelineContentKind
@@ -174,7 +167,6 @@ import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.launch
-import java.io.File
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
@@ -206,6 +198,10 @@ fun ConversationScreen(
     jumpToEventId: String? = null,
     onConsumeJumpToEvent: () -> Unit = {},
     onJumpToReply: (String) -> Unit = {},
+    mentionWatermarkMs: Long = -1L,
+    reactionWatermarkMs: Long = -1L,
+    onMentionRead: (Long) -> Unit = {},
+    onReactionRead: (Long) -> Unit = {},
     pendingComposeReply: PendingComposeReply? = null,
     onClearComposeReply: () -> Unit = {},
     onReplyToMessage: (TimelineMessage) -> Unit = {},
@@ -347,16 +343,41 @@ fun ConversationScreen(
             }
     }
 
-    val mentionTarget = remember(messages) {
-        messages.filter { it.mentionsMe && !it.isOwn }.maxByOrNull { it.timestampMs }
+    val unreadMentions = remember(messages, mentionWatermarkMs) {
+        messages.filter { it.mentionsMe && !it.isOwn && it.timestampMs > mentionWatermarkMs }
+            .sortedBy { it.timestampMs }
     }
-    var dismissedMentionIds by remember(roomId) { mutableStateOf<Set<String>>(emptySet()) }
-    val pendingMention = mentionTarget?.takeIf { it.eventId.value !in dismissedMentionIds }
+    val unreadReactions = remember(messages, reactionWatermarkMs) {
+        messages.filter { msg ->
+            msg.isOwn && (msg.latestForeignReactionMs ?: Long.MIN_VALUE) > reactionWatermarkMs
+        }.sortedBy { it.latestForeignReactionMs ?: 0L }
+    }
+    val pendingMention = unreadMentions.firstOrNull()
+    val pendingReaction = unreadReactions.lastOrNull()
     val mentionIndex = remember(pendingMention, display) {
         pendingMention?.let { m -> display.indexOfFirst { it.eventId.value == m.eventId.value } } ?: -1
     }
-    val mentionVisible = mentionIndex >= 0 &&
-        listState.layoutInfo.visibleItemsInfo.any { it.index == mentionIndex }
+    val reactionIndex = remember(pendingReaction, display) {
+        pendingReaction?.let { m -> display.indexOfFirst { it.eventId.value == m.eventId.value } } ?: -1
+    }
+    val visibleIds = remember {
+        derivedStateOf {
+            listState.layoutInfo.visibleItemsInfo.mapNotNull { info ->
+                displayState.value.getOrNull(info.index)?.eventId?.value
+            }.toSet()
+        }
+    }
+    val mentionVisible = pendingMention != null && pendingMention.eventId.value in visibleIds.value
+    val reactionVisible = pendingReaction != null && pendingReaction.eventId.value in visibleIds.value
+
+    LaunchedEffect(roomId, unreadMentions, unreadReactions, visibleIds.value) {
+        val visible = visibleIds.value
+        unreadMentions.filter { it.eventId.value in visible }.maxOfOrNull { it.timestampMs }
+            ?.let(onMentionRead)
+        unreadReactions.filter { it.eventId.value in visible }
+            .maxOfOrNull { it.latestForeignReactionMs ?: 0L }
+            ?.let(onReactionRead)
+    }
 
     LaunchedEffect(roomId, display.size, listState) {
         snapshotFlow {
@@ -472,27 +493,62 @@ fun ConversationScreen(
                     }
                 }
 
-                if (pendingMention != null && mentionIndex >= 0 && !mentionVisible) {
-                    FilledTonalButton(
-                        onClick = {
-                            val mid = pendingMention.eventId.value
-                            scope.launch {
-                                listState.scrollToItem(mentionIndex, 0)
-                                dismissedMentionIds = dismissedMentionIds + mid
-                            }
-                        },
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .padding(horizontal = 16.dp, vertical = 10.dp)
-                            .fillMaxWidth(0.92f),
-                        shape = RoundedCornerShape(24.dp),
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .padding(start = 12.dp, bottom = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    if (pendingReaction != null && !reactionVisible) {
+                        SmallFloatingActionButton(
+                            onClick = {
+                                val target = pendingReaction.eventId.value
+                                scope.launch {
+                                    if (reactionIndex >= 0) {
+                                        listState.animateScrollToItem(reactionIndex, 0)
+                                        highlightEventId = target
+                                    } else {
+                                        onJumpToReply(target)
+                                    }
+                                }
+                            },
+                            containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
                         ) {
-                            Icon(Icons.Outlined.Notifications, contentDescription = null)
-                            Text("You were mentioned — view")
+                            Text("❤", style = MaterialTheme.typography.titleMedium)
+                        }
+                    }
+                    if (pendingMention != null && !mentionVisible) {
+                        BadgedBox(
+                            badge = {
+                                if (unreadMentions.size > 1) {
+                                    Badge {
+                                        Text(if (unreadMentions.size > 99) "99+" else unreadMentions.size.toString())
+                                    }
+                                }
+                            },
+                        ) {
+                            SmallFloatingActionButton(
+                                onClick = {
+                                    val target = pendingMention.eventId.value
+                                    scope.launch {
+                                        if (mentionIndex >= 0) {
+                                            listState.animateScrollToItem(mentionIndex, 0)
+                                            highlightEventId = target
+                                        } else {
+                                            onJumpToReply(target)
+                                        }
+                                    }
+                                },
+                                containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                                contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                            ) {
+                                Text(
+                                    "@",
+                                    style = MaterialTheme.typography.titleLarge,
+                                    fontWeight = FontWeight.Bold,
+                                )
+                            }
                         }
                     }
                 }
@@ -1588,14 +1644,18 @@ private fun MusicFileRow(
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         Icon(
-            imageVector = Icons.Filled.Audiotrack,
+            imageVector = if (message.isVoiceMessage) Icons.Filled.Mic else Icons.Filled.Audiotrack,
             contentDescription = null,
             tint = metaColor,
             modifier = Modifier.size(22.dp),
         )
         Column(Modifier.weight(1f)) {
             Text(
-                text = message.body.ifBlank { "Audio" },
+                text = if (message.isVoiceMessage) {
+                    "Voice message"
+                } else {
+                    message.body.ifBlank { "Audio" }
+                },
                 style = MaterialTheme.typography.bodyLarge,
                 color = bodyColor,
                 maxLines = 1,
@@ -1643,113 +1703,16 @@ private fun MatrixAudioAttachment(
     onOpen: () -> Unit,
     onLongPress: () -> Unit,
 ) {
-    if (!message.isVoiceMessage) {
-        MusicFileRow(
-            message = message,
-            bodyColor = bodyColor,
-            metaColor = metaColor,
-            isPreparing = isPreparing,
-            isPlaying = isCurrentTrack && musicIsPlaying,
-            onPlay = { onPlayMusic(message) },
-            onOpen = onOpen,
-            onLongPress = onLongPress,
-        )
-        return
-    }
-    val src = message.mediaSourceJson
-    if (src == null) {
-        Text(message.body, style = MaterialTheme.typography.bodyLarge, color = bodyColor)
-        return
-    }
-    val context = LocalContext.current
-    val bytes by produceState<ByteArray?>(null, src, message.eventId) {
-        value = media.loadContent(src)
-    }
-
-    val uri = remember(bytes) {
-        bytes?.let { b ->
-            val ext = if (message.isVoiceMessage) "ogg" else "audio"
-            val f = File(context.cacheDir, "ax_${message.eventId.value}.$ext")
-            f.writeBytes(b)
-            Uri.fromFile(f)
-        }
-    }
-
-    val player = remember(message.eventId) {
-        ExoPlayer.Builder(context).build()
-    }
-    var playing by remember { mutableStateOf(false) }
-
-    LaunchedEffect(uri) {
-        val u = uri ?: return@LaunchedEffect
-        player.setMediaItem(MediaItem.fromUri(u))
-        player.prepare()
-        player.playWhenReady = false
-        playing = false
-    }
-
-    DisposableEffect(player) {
-        val listener = object : Player.Listener {
-            override fun onIsPlayingChanged(isPlaying: Boolean) {
-                playing = isPlaying
-            }
-        }
-        player.addListener(listener)
-        onDispose {
-            player.removeListener(listener)
-            player.release()
-        }
-    }
-
-    Row(
-        modifier = Modifier.combinedClickable(onClick = onOpen, onLongClick = onLongPress),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        Icon(
-            imageVector = Icons.Filled.Mic,
-            contentDescription = null,
-            tint = metaColor,
-            modifier = Modifier.size(22.dp),
-        )
-        Column(Modifier.weight(1f)) {
-            Text(
-                text = if (message.isVoiceMessage) "Voice message" else message.body,
-                style = MaterialTheme.typography.bodyLarge,
-                color = bodyColor,
-            )
-            message.mediaDurationMs?.takeIf { it > 0 }?.let {
-                Text(
-                    formatDuration(it),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = metaColor,
-                )
-            }
-        }
-        IconButton(
-            onClick = {
-                val u = uri
-                if (u == null) return@IconButton
-                if (playing) player.pause() else {
-                    player.playWhenReady = true
-                    player.play()
-                }
-            },
-            enabled = uri != null,
-            colors = IconButtonDefaults.iconButtonColors(
-                contentColor = bodyColor,
-                disabledContentColor = metaColor.copy(alpha = 0.35f),
-            ),
-        ) {
-            if (bytes == null) {
-                CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp, color = metaColor)
-            } else if (playing) {
-                Icon(Icons.Filled.Pause, contentDescription = "Pause")
-            } else {
-                Icon(Icons.Filled.PlayArrow, contentDescription = "Play")
-            }
-        }
-    }
+    MusicFileRow(
+        message = message,
+        bodyColor = bodyColor,
+        metaColor = metaColor,
+        isPreparing = isPreparing,
+        isPlaying = isCurrentTrack && musicIsPlaying,
+        onPlay = { onPlayMusic(message) },
+        onOpen = onOpen,
+        onLongPress = onLongPress,
+    )
 }
 
 @Composable

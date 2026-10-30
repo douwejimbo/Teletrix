@@ -130,6 +130,8 @@ data class TimelineMessage(
     val readByUserIds: List<String> = emptyList(),
     /** Other users whose read receipt points at this event (own outgoing bubbles). */
     val readReceiptOtherCount: Int = 0,
+    /** Latest reaction from someone else on this event, if any. */
+    val latestForeignReactionMs: Long? = null,
 )
 
 data class HomeserverLoginDetails(
