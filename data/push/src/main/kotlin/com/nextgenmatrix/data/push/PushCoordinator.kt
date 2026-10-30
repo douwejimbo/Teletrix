@@ -17,11 +17,14 @@ import org.unifiedpush.android.connector.UnifiedPush
 import javax.inject.Inject
 import javax.inject.Singleton
 
+data class OpenJump(val roomId: String, val eventId: String)
+
 @Singleton
 class PushCoordinator @Inject constructor(
     @ApplicationContext private val context: Context,
     private val matrix: MatrixRepository,
     private val notifier: TeletrixNotifier,
+    private val notifyPrefs: NotificationPreferences,
     dispatchers: AppDispatchers,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + dispatchers.io)
@@ -29,6 +32,9 @@ class PushCoordinator @Inject constructor(
 
     private val _openRoomId = MutableStateFlow<String?>(null)
     val openRoomId: StateFlow<String?> = _openRoomId.asStateFlow()
+
+    private val _openJump = MutableStateFlow<OpenJump?>(null)
+    val openJump: StateFlow<OpenJump?> = _openJump.asStateFlow()
 
     @Volatile
     private var unifiedPushReady = false
@@ -43,16 +49,30 @@ class PushCoordinator @Inject constructor(
         scope.launch {
             matrix.incomingNotifications.collect { notifier.show(it) }
         }
+        scope.launch {
+            notifyPrefs.value.collect { next ->
+                matrix.setNotificationPrefs(next)
+                if (matrix.isLoggedIn.value) {
+                    runCatching { matrix.applyNotificationPrefs() }
+                }
+            }
+        }
     }
 
-    fun offerOpenRoom(roomId: String) {
+    fun offerOpenRoom(roomId: String, eventId: String? = null) {
         _openRoomId.value = roomId
+        val jump = eventId?.takeIf { it.isNotBlank() }
+        _openJump.value = if (jump != null) OpenJump(roomId, jump) else null
         notifier.clearRoom(roomId)
         matrix.setActiveConversation(roomId)
     }
 
     fun consumeOpenRoom() {
         _openRoomId.value = null
+    }
+
+    fun consumeOpenEvent() {
+        _openJump.value = null
     }
 
     fun onNewEndpoint(url: String) {
@@ -81,6 +101,8 @@ class PushCoordinator @Inject constructor(
     }
 
     private fun onSignedIn() {
+        matrix.setNotificationPrefs(notifyPrefs.current())
+        scope.launch { runCatching { matrix.applyNotificationPrefs() } }
         registerUnifiedPush()
         val saved = prefs.getString(KEY_UP_ENDPOINT, null)
         if (!saved.isNullOrBlank()) {
@@ -136,8 +158,8 @@ class PushCoordinator @Inject constructor(
         return created
     }
 
-    companion object {
-        private const val KEY_UP_ENDPOINT = "up_endpoint"
-        private const val KEY_NTFY_TOPIC = "ntfy_topic"
+    private companion object {
+        const val KEY_UP_ENDPOINT = "up_endpoint"
+        const val KEY_NTFY_TOPIC = "ntfy_topic"
     }
 }

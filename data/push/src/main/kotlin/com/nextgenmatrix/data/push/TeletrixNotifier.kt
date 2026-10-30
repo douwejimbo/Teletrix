@@ -73,7 +73,7 @@ class TeletrixNotifier @Inject constructor(
             .setAutoCancel(true)
             .setOnlyAlertOnce(false)
             .setGroup(item.roomId)
-            .setContentIntent(openRoomIntent(item.roomId))
+            .setContentIntent(openRoomIntent(item.roomId, item.jumpEventId ?: item.eventId))
             .setColor(ContextCompat.getColor(context, android.R.color.holo_blue_dark))
             .setNumber(synchronized(lines) { lines.size })
             .build()
@@ -104,8 +104,16 @@ class TeletrixNotifier @Inject constructor(
             .build()
     }
 
-    private fun openRoomIntent(roomId: String): PendingIntent {
-        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("teletrix://room/${Uri.encode(roomId)}")).apply {
+    private fun openRoomIntent(roomId: String, eventId: String? = null): PendingIntent {
+        val uri = Uri.Builder()
+            .scheme("teletrix")
+            .authority("room")
+            .appendPath(roomId)
+            .apply {
+                if (!eventId.isNullOrBlank()) appendQueryParameter("event", eventId)
+            }
+            .build()
+        val intent = Intent(Intent.ACTION_VIEW, uri).apply {
             setClassName(context.packageName, "com.nextgenmatrix.app.MainActivity")
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }

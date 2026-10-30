@@ -8,7 +8,9 @@ import com.nextgenmatrix.core.model.AccountSummary
 import com.nextgenmatrix.core.model.DirectoryEntry
 import com.nextgenmatrix.core.model.DirectoryPage
 import com.nextgenmatrix.core.model.HomeserverLoginDetails
+import com.nextgenmatrix.core.model.ChatNotifyMode
 import com.nextgenmatrix.core.model.IncomingNotification
+import com.nextgenmatrix.core.model.NotificationPrefs
 import com.nextgenmatrix.core.model.MatrixRoomId
 import com.nextgenmatrix.core.model.MentionTag
 import com.nextgenmatrix.core.model.RoomMemberBrief
@@ -86,7 +88,11 @@ import org.matrix.rustcomponents.sdk.ProgressWatcher
 import org.matrix.rustcomponents.sdk.ReceiptType
 import org.matrix.rustcomponents.sdk.SlidingSyncVersionBuilder
 import org.matrix.rustcomponents.sdk.SqliteStoreBuilder as SdkSqliteStoreBuilder
+import org.matrix.rustcomponents.sdk.Action
 import org.matrix.rustcomponents.sdk.HttpPusherData
+import org.matrix.rustcomponents.sdk.PushCondition
+import org.matrix.rustcomponents.sdk.RoomNotificationMode
+import org.matrix.rustcomponents.sdk.RuleKind
 import org.matrix.rustcomponents.sdk.NotificationEvent
 import org.matrix.rustcomponents.sdk.NotificationItem
 import org.matrix.rustcomponents.sdk.NotificationProcessSetup
@@ -166,6 +172,10 @@ interface MatrixRepository {
 
     /** Fetch and decrypt one event for a push payload. Restores the session if needed. */
     suspend fun notificationForEvent(roomId: String, eventId: String): IncomingNotification?
+
+    fun setNotificationPrefs(prefs: NotificationPrefs)
+
+    suspend fun applyNotificationPrefs()
 
     suspend fun approveSessionVerification()
     suspend fun declineSessionVerification()
@@ -282,6 +292,9 @@ class DefaultMatrixRepository @Inject constructor(
 
     @Volatile
     private var registeredPushkey: String? = null
+
+    @Volatile
+    private var notificationPrefs: NotificationPrefs = NotificationPrefs()
 
     private val pusherAppId = "com.nextgenmatrix.app.android"
 
@@ -827,7 +840,10 @@ class DefaultMatrixRepository @Inject constructor(
                             runCatching { item.destroy() }
                         }
                     }
-                    else -> null
+                    is NotificationStatus.EventFilteredOut ->
+                        loadReactionNotification(roomId, eventId, c.userId())
+                    else ->
+                        loadReactionNotification(roomId, eventId, c.userId())
                 }
             } finally {
                 runCatching { nc.destroy() }
@@ -839,7 +855,7 @@ class DefaultMatrixRepository @Inject constructor(
         return restoreSession().isSuccess && _isLoggedIn.value
     }
 
-    private fun mapNotificationItem(
+    private suspend fun mapNotificationItem(
         item: NotificationItem,
         roomId: String,
         ownUserId: String,
@@ -852,10 +868,7 @@ class DefaultMatrixRepository @Inject constructor(
         }
         if (senderId == ownUserId) return null
         val isInvite = item.event is NotificationEvent.Invite
-        val body = when {
-            isInvite -> "Invited you to a room"
-            else -> bodyFromRawEvent(item.rawEvent)
-        }
+        val reaction = parseReaction(item.rawEvent)
         val sender = item.senderInfo.displayName?.takeIf { it.isNotBlank() }
             ?: senderId.substringAfter("@").substringBefore(":").ifBlank { senderId }
         val roomTitle = item.roomInfo.displayName?.takeIf { it.isNotBlank() } ?: roomId
@@ -863,7 +876,12 @@ class DefaultMatrixRepository @Inject constructor(
             is NotificationEvent.Timeline -> ev.event.eventId()
             else -> ""
         }
-        return IncomingNotification(
+        val body = when {
+            isInvite -> "Invited you to a room"
+            reaction != null -> "$sender reacted ${reaction.key}"
+            else -> bodyFromRawEvent(item.rawEvent)
+        }
+        val mapped = IncomingNotification(
             roomId = roomId,
             eventId = eventId,
             roomTitle = roomTitle,
@@ -872,7 +890,12 @@ class DefaultMatrixRepository @Inject constructor(
             isDirect = item.roomInfo.isDirect || item.roomInfo.isDm,
             isInvite = isInvite,
             noisy = item.isNoisy != false,
+            hasMention = item.hasMention == true || mentionsOwnUser(item.rawEvent, ownUserId),
+            isReaction = reaction != null,
+            jumpEventId = reaction?.eventId,
+            reactionKey = reaction?.key,
         )
+        return if (shouldNotify(mapped, ownUserId, reaction?.eventId, roomId)) mapped else null
     }
 
     private fun bodyFromRawEvent(raw: String?): String {
@@ -901,7 +924,172 @@ class DefaultMatrixRepository @Inject constructor(
 
     private fun emitIncoming(item: IncomingNotification) {
         if (item.roomId == activeConversationRoomId) return
+        if (item.jumpEventId == null && item.isReaction) return
         _incomingNotifications.tryEmit(item)
+    }
+
+    override fun setNotificationPrefs(prefs: NotificationPrefs) {
+        notificationPrefs = prefs
+    }
+
+    override suspend fun applyNotificationPrefs() =
+        withContext(dispatchers.io) {
+            val c = mutex.withLock { client } ?: return@withContext
+            val prefs = notificationPrefs
+            val settings = try {
+                c.getNotificationSettings()
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                return@withContext
+            }
+            try {
+                val dmMode = if (!prefs.enabled) ChatNotifyMode.Off else prefs.privateChats
+                val groupMode = if (!prefs.enabled) ChatNotifyMode.Off else prefs.groups
+                listOf(false, true).forEach { encrypted ->
+                    try {
+                        settings.setDefaultRoomNotificationMode(encrypted, true, toSdkMode(dmMode))
+                    } catch (t: Throwable) {
+                        if (t is CancellationException) throw t
+                    }
+                    try {
+                        settings.setDefaultRoomNotificationMode(encrypted, false, toSdkMode(groupMode))
+                    } catch (t: Throwable) {
+                        if (t is CancellationException) throw t
+                    }
+                }
+                try {
+                    settings.setUserMentionEnabled(prefs.enabled)
+                } catch (t: Throwable) {
+                    if (t is CancellationException) throw t
+                }
+                try {
+                    settings.setRoomMentionEnabled(prefs.enabled)
+                } catch (t: Throwable) {
+                    if (t is CancellationException) throw t
+                }
+                if (prefs.enabled && prefs.reactions) {
+                    try {
+                        settings.setCustomPushRule(
+                            REACTION_RULE_ID,
+                            RuleKind.Override,
+                            listOf(Action.Notify),
+                            listOf(PushCondition.EventMatch("type", "m.reaction")),
+                        )
+                    } catch (t: Throwable) {
+                        if (t is CancellationException) throw t
+                    }
+                }
+            } finally {
+                runCatching { settings.destroy() }
+            }
+        }
+
+    private fun toSdkMode(mode: ChatNotifyMode): RoomNotificationMode = when (mode) {
+        ChatNotifyMode.All -> RoomNotificationMode.ALL_MESSAGES
+        ChatNotifyMode.Mentions -> RoomNotificationMode.MENTIONS_AND_KEYWORDS_ONLY
+        ChatNotifyMode.Off -> RoomNotificationMode.MUTE
+    }
+
+    private suspend fun shouldNotify(
+        item: IncomingNotification,
+        ownUserId: String,
+        reactionTargetId: String?,
+        roomId: String,
+    ): Boolean {
+        val prefs = notificationPrefs
+        if (!prefs.enabled) return false
+        if (item.roomId == activeConversationRoomId) return false
+        if (item.isInvite) return true
+        if (item.isReaction) {
+            if (!prefs.reactions || reactionTargetId.isNullOrBlank()) return false
+            return reactionTargetsOwnMessage(roomId, reactionTargetId, ownUserId)
+        }
+        val mode = if (item.isDirect) prefs.privateChats else prefs.groups
+        return when (mode) {
+            ChatNotifyMode.All -> true
+            ChatNotifyMode.Mentions -> item.hasMention
+            ChatNotifyMode.Off -> false
+        }
+    }
+
+    private suspend fun reactionTargetsOwnMessage(roomId: String, eventId: String, ownUserId: String): Boolean {
+        val room = mutex.withLock { client?.getRoom(roomId) } ?: return false
+        return runCatching {
+            val ev = room.loadOrFetchEvent(eventId)
+            try {
+                ev.senderId() == ownUserId
+            } finally {
+                runCatching { ev.destroy() }
+            }
+        }.getOrDefault(false)
+    }
+
+    private suspend fun loadReactionNotification(
+        roomId: String,
+        eventId: String,
+        ownUserId: String,
+    ): IncomingNotification? {
+        val room = mutex.withLock { client?.getRoom(roomId) } ?: return null
+        val ev = runCatching { room.loadOrFetchEvent(eventId) }.getOrNull() ?: return null
+        return try {
+            val raw = runCatching { ev.content() }.getOrNull()
+            val reaction = parseReactionFromRelated(ev, raw) ?: return null
+            if (ev.senderId() == ownUserId) return null
+            if (!notificationPrefs.enabled || !notificationPrefs.reactions) return null
+            if (!reactionTargetsOwnMessage(roomId, reaction.eventId, ownUserId)) return null
+            val sender = ev.senderId().substringAfter("@").substringBefore(":")
+            val summary = _rooms.value.firstOrNull { it.roomId.value == roomId }
+            IncomingNotification(
+                roomId = roomId,
+                eventId = ev.eventId(),
+                roomTitle = summary?.title ?: roomId,
+                senderName = sender,
+                body = "$sender reacted ${reaction.key}",
+                isDirect = summary?.presentationKind == RoomPresentationKind.DirectMessage,
+                isReaction = true,
+                jumpEventId = reaction.eventId,
+                reactionKey = reaction.key,
+            )
+        } finally {
+            runCatching { ev.destroy() }
+        }
+    }
+
+    private data class ReactionRef(val eventId: String, val key: String)
+
+    private fun parseReaction(raw: String?): ReactionRef? {
+        if (raw.isNullOrBlank()) return null
+        return runCatching {
+            val obj = JSONObject(raw)
+            val type = obj.optString("type")
+            val content = obj.optJSONObject("content") ?: obj
+            val relates = content.optJSONObject("m.relates_to") ?: return@runCatching null
+            if (type.isNotBlank() && type != "m.reaction" &&
+                relates.optString("rel_type") != "m.annotation"
+            ) {
+                return@runCatching null
+            }
+            val target = relates.optString("event_id")
+            val key = relates.optString("key").ifBlank { "❤" }
+            if (target.isBlank()) null else ReactionRef(target, key)
+        }.getOrNull()
+    }
+
+    private fun parseReactionFromRelated(
+        ev: org.matrix.rustcomponents.sdk.TimelineEvent,
+        content: org.matrix.rustcomponents.sdk.TimelineEventContent?,
+    ): ReactionRef? {
+        try {
+            val related = (content as? org.matrix.rustcomponents.sdk.TimelineEventContent.MessageLike)
+                ?.content as? org.matrix.rustcomponents.sdk.MessageLikeEventContent.ReactionContent
+            if (related != null) {
+                return ReactionRef(related.relatedEventId, "❤")
+            }
+        } catch (_: Throwable) {
+        } finally {
+            runCatching { content?.destroy() }
+        }
+        return null
     }
 
     override suspend fun loadMatrixMediaThumbnail(
@@ -1559,17 +1747,20 @@ class DefaultMatrixRepository @Inject constructor(
         runCatching { refreshAccount() }
         runCatching { ensureSessionVerificationController(c) }
         runCatching { attachSyncNotifications(c) }
+        runCatching { applyNotificationPrefs() }
     }
 
     private suspend fun attachSyncNotifications(c: Client) {
         c.registerNotificationHandler(
             object : SyncNotificationListener {
                 override fun onNotification(notification: NotificationItem, roomId: String) {
-                    try {
-                        val own = runCatching { c.userId() }.getOrNull() ?: return
-                        mapNotificationItem(notification, roomId, own)?.let(::emitIncoming)
-                    } finally {
-                        runCatching { notification.destroy() }
+                    scope.launch {
+                        try {
+                            val own = runCatching { c.userId() }.getOrNull() ?: return@launch
+                            mapNotificationItem(notification, roomId, own)?.let(::emitIncoming)
+                        } finally {
+                            runCatching { notification.destroy() }
+                        }
                     }
                 }
             },
@@ -2193,8 +2384,31 @@ class DefaultMatrixRepository @Inject constructor(
         val cache: File,
     )
 
+    private fun mentionsOwnUser(raw: String?, ownUserId: String): Boolean {
+        if (raw.isNullOrBlank() || ownUserId.isBlank()) return false
+        return runCatching {
+            val obj = JSONObject(raw)
+            val content = obj.optJSONObject("content") ?: return@runCatching false
+            val mentions = content.optJSONObject("m.mentions")
+            if (mentions?.optBoolean("room") == true) return@runCatching true
+            val users = mentions?.optJSONArray("user_ids")
+            if (users != null) {
+                for (i in 0 until users.length()) {
+                    if (users.optString(i) == ownUserId) return@runCatching true
+                }
+            }
+            val local = ownUserId.substringAfter("@").substringBefore(":")
+            val body = content.optString("body")
+            val formatted = content.optJSONObject("formatted_body")?.toString()
+                ?: content.optString("formatted_body")
+            ownUserId in body || "@$local" in body ||
+                (!formatted.isNullOrBlank() && (ownUserId in formatted || "@$local" in formatted))
+        }.getOrDefault(false)
+    }
+
     private companion object {
         const val VERIFY_LOG = "NgVerify"
+        const val REACTION_RULE_ID = "com.nextgenmatrix.app.reaction"
 
         /** How long to let the other client send its SAS start before we send ours. */
         const val SAS_START_GRACE_MS = 4_000L

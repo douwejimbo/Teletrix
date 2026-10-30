@@ -446,11 +446,18 @@ private fun formatLastActivity(ms: Long?): String? {
 fun ConversationRoute(
     roomId: String,
     modifier: Modifier = Modifier,
+    initialJumpEventId: String? = null,
+    onJumpFromNotification: () -> Unit = {},
     viewModel: ConversationViewModel = hiltViewModel(),
 ) {
     LaunchedEffect(roomId) {
         viewModel.bindRoom(roomId)
         viewModel.loadDraft(roomId)
+    }
+    LaunchedEffect(roomId, initialJumpEventId) {
+        val target = initialJumpEventId?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
+        viewModel.jumpToReply(target)
+        onJumpFromNotification()
     }
     val timeline by viewModel.messages.collectAsStateWithLifecycle()
     val items = timeline[roomId].orEmpty()

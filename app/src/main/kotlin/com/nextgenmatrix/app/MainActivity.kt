@@ -118,18 +118,27 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun offerRoomFromIntent(intent: Intent?) {
-        roomIdFromIntent(intent)?.let { pushCoordinator.offerOpenRoom(it) }
+        val target = roomTargetFromIntent(intent) ?: return
+        pushCoordinator.offerOpenRoom(target.roomId, target.eventId)
     }
 }
 
-internal fun roomIdFromIntent(intent: Intent?): String? {
+internal data class RoomOpenTarget(val roomId: String, val eventId: String? = null)
+
+internal fun roomTargetFromIntent(intent: Intent?): RoomOpenTarget? {
     if (intent == null) return null
-    intent.getStringExtra("room_id")?.takeIf { it.isNotBlank() }?.let { return it }
+    intent.getStringExtra("room_id")?.takeIf { it.isNotBlank() }?.let { roomId ->
+        val event = intent.getStringExtra("event_id")?.takeIf { it.isNotBlank() }
+        return RoomOpenTarget(roomId, event)
+    }
     val data = intent.data ?: return null
     if (data.scheme != "teletrix" || data.host != "room") return null
     val encoded = data.pathSegments.firstOrNull() ?: return null
-    return Uri.decode(encoded)
+    val event = data.getQueryParameter("event")?.takeIf { it.isNotBlank() }
+    return RoomOpenTarget(Uri.decode(encoded), event)
 }
+
+internal fun roomIdFromIntent(intent: Intent?): String? = roomTargetFromIntent(intent)?.roomId
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -157,6 +166,7 @@ private fun AppRoot() {
     val chatListVm: ChatListViewModel = hiltViewModel()
     val rooms by chatListVm.rooms.collectAsStateWithLifecycle()
     val openRoomId by activity.pushCoordinator.openRoomId.collectAsStateWithLifecycle()
+    val openJump by activity.pushCoordinator.openJump.collectAsStateWithLifecycle()
     val notifyPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { }
@@ -339,14 +349,22 @@ private fun AppRoot() {
                             arguments = listOf(navArgument("roomId") { type = NavType.StringType }),
                         ) { entry ->
                             val id = entry.arguments?.getString("roomId")!!
-                            ConversationRoute(roomId = id)
+                            ConversationRoute(
+                                roomId = id,
+                                initialJumpEventId = openJump?.takeIf { it.roomId == id }?.eventId,
+                                onJumpFromNotification = activity.pushCoordinator::consumeOpenEvent,
+                            )
                         }
                         composable("settings") {
+                            val notifyVm: NotificationSettingsViewModel = hiltViewModel()
+                            val notifyPrefs by notifyVm.prefs.collectAsStateWithLifecycle()
                             SettingsRoute(
                                 themeMode = themeMode,
                                 onThemeMode = appearanceVm::setThemeMode,
                                 contrastMode = contrast,
                                 onContrastMode = appearanceVm::setContrastMode,
+                                notifyPrefs = notifyPrefs,
+                                onNotifyPrefs = notifyVm::update,
                                 onVerifySession = { sessionVerifyVm.requestVerification() },
                             )
                         }
