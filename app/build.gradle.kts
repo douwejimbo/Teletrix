@@ -21,23 +21,6 @@ android {
         versionName = "0.2.0"
     }
 
-    buildTypes {
-        release {
-            isMinifyEnabled = true
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro",
-            )
-            val releaseCfg = signingConfigs.findByName("release")
-            if (releaseCfg != null) {
-                signingConfig = releaseCfg
-            }
-        }
-        debug {
-            isMinifyEnabled = false
-        }
-    }
-
     signingConfigs {
         val keystorePropsFile = rootProject.file("keystore.properties")
         if (keystorePropsFile.exists()) {
@@ -49,6 +32,20 @@ android {
                 keyAlias = keystoreProps["keyAlias"] as String
                 keyPassword = keystoreProps["keyPassword"] as String
             }
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
+            signingConfigs.findByName("release")?.let { signingConfig = it }
+        }
+        debug {
+            isMinifyEnabled = false
         }
     }
 
