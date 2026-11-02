@@ -1,6 +1,10 @@
 package com.nextgenmatrix.matrix
 
+import android.app.Activity
+import android.app.Application
 import android.content.Context
+import android.os.Bundle
+import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.CancellationException
 import com.nextgenmatrix.core.common.AppDispatchers
@@ -20,6 +24,7 @@ import com.nextgenmatrix.core.model.SpaceContents
 import com.nextgenmatrix.core.model.SpaceEntry
 import com.nextgenmatrix.core.model.SessionVerificationPhase
 import com.nextgenmatrix.core.model.SessionVerificationPrompt
+import com.nextgenmatrix.core.model.TimelineContentKind
 import com.nextgenmatrix.core.model.TimelineMessage
 import com.nextgenmatrix.core.model.VerificationEmoji
 import com.nextgenmatrix.matrix.delegate.NgMatrixClientDelegate
@@ -101,6 +106,9 @@ import org.matrix.rustcomponents.sdk.PushFormat
 import org.matrix.rustcomponents.sdk.PusherIdentifiers
 import org.matrix.rustcomponents.sdk.PusherKind
 import org.matrix.rustcomponents.sdk.SyncNotificationListener
+import org.matrix.rustcomponents.sdk.SyncServiceState
+import org.matrix.rustcomponents.sdk.SyncServiceStateObserver
+import org.matrix.rustcomponents.sdk.EventOrTransactionId
 import org.matrix.rustcomponents.sdk.Timeline
 import org.matrix.rustcomponents.sdk.TimelineDiff
 import org.matrix.rustcomponents.sdk.TimelineItem
@@ -153,6 +161,8 @@ interface MatrixRepository {
     suspend fun sendAttachment(roomId: MatrixRoomId, bytes: ByteArray, fileName: String, mimeType: String)
     /** Uploads bytes and sends them as an `m.sticker` event. */
     suspend fun sendSticker(roomId: MatrixRoomId, bytes: ByteArray, fileName: String, mimeType: String)
+    /** Redacts an event this account sent. [eventId] may be a real id or a `txn:` local echo. */
+    suspend fun redactMessage(roomId: MatrixRoomId, eventId: String)
     suspend fun paginateBack(roomId: MatrixRoomId): Boolean
 
     /**
@@ -164,6 +174,7 @@ interface MatrixRepository {
     val incomingNotifications: SharedFlow<IncomingNotification>
 
     /** Room the user is looking at; notifications for it are suppressed. */
+    val activeConversationRoomId: StateFlow<String?>
     fun setActiveConversation(roomId: String?)
 
     suspend fun registerHttpPusher(pushkey: String)
@@ -234,6 +245,10 @@ class DefaultMatrixRepository @Inject constructor(
     private val scope = CoroutineScope(SupervisorJob() + dispatchers.io)
     private val mutex = Mutex()
 
+    init {
+        installForegroundSyncHook()
+    }
+
     private var client: Client? = null
     private var syncService: ClientSyncService? = null
     private var sessionPaths: SessionPaths? = null
@@ -270,6 +285,16 @@ class DefaultMatrixRepository @Inject constructor(
     private val _timeline = MutableStateFlow<Map<String, List<TimelineMessage>>>(emptyMap())
     override val timelineMessages: StateFlow<Map<String, List<TimelineMessage>>> = _timeline.asStateFlow()
 
+    /** Last SDK-mapped page per room (oldest-first), before local media stitching. */
+    private val sdkMapped = java.util.concurrent.ConcurrentHashMap<String, List<TimelineMessage>>()
+
+    /** Playable media we have already seen, kept after the homeserver redacts the event. */
+    private val retainedMedia = java.util.concurrent.ConcurrentHashMap<String, TimelineMessage>()
+
+    /** Media fetched via /messages or /context that sliding-sync extras omitted. */
+    private val backfilledMedia =
+        java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.ConcurrentHashMap<String, TimelineMessage>>()
+
     /** Avatars repeat on every message row, so decoded thumbnails bytes are kept in memory. */
     private val avatarCache = object : android.util.LruCache<String, ByteArray>(6 * 1024 * 1024) {
         override fun sizeOf(key: String, value: ByteArray): Int = value.size
@@ -287,8 +312,10 @@ class DefaultMatrixRepository @Inject constructor(
     private val _incomingNotifications = MutableSharedFlow<IncomingNotification>(extraBufferCapacity = 64)
     override val incomingNotifications: SharedFlow<IncomingNotification> = _incomingNotifications.asSharedFlow()
 
-    @Volatile
-    private var activeConversationRoomId: String? = null
+    private val _activeConversationRoomId = MutableStateFlow<String?>(null)
+    override val activeConversationRoomId: StateFlow<String?> = _activeConversationRoomId.asStateFlow()
+    private val activeConversationRoomIdValue: String?
+        get() = _activeConversationRoomId.value
 
     @Volatile
     private var registeredPushkey: String? = null
@@ -584,7 +611,7 @@ class DefaultMatrixRepository @Inject constructor(
                 _roomMembers.value = emptyMap()
                 unreadHolds.clear()
                 unreadHoldsLoaded = false
-                activeConversationRoomId = null
+                _activeConversationRoomId.value = null
                 registeredPushkey = null
                 paths
             }
@@ -614,13 +641,16 @@ class DefaultMatrixRepository @Inject constructor(
                 activeTimeline = timeline
                 activeTimelineRoomId = roomId.value
             }
+            subscribeToLiveRooms(sync, roomId.value)
             val own = c.userId()
             timelineHandle = timeline.addListener(
                 object : TimelineListener {
                     override fun onUpdate(diffs: List<TimelineDiff>) {
                         diffs.forEach { TimelineDiffApplier.apply(timelineItems, it) }
                         val mapped = TimelineMessageMapper.mapItems(roomId, own, timelineItems)
-                        _timeline.update { it + (roomId.value to mapped) }
+                        rememberPlayable(mapped)
+                        sdkMapped[roomId.value] = mapped
+                        publishTimeline(roomId.value)
                     }
                 },
             )
@@ -628,6 +658,15 @@ class DefaultMatrixRepository @Inject constructor(
                 runCatching {
                     val members = loadRoomMembersFor(room)
                     _roomMembers.update { it + (roomId.value to members) }
+                }
+            }
+            scope.launch(dispatchers.io) {
+                for (page in 0 until 4) {
+                    if (activeTimelineRoomId != roomId.value) return@launch
+                    if (runCatching { timeline.paginateBackwards(50u) }.getOrNull() != true) break
+                }
+                if (activeTimelineRoomId == roomId.value) {
+                    backfillMissingMedia(c, roomId, own)
                 }
             }
         }
@@ -758,6 +797,31 @@ class DefaultMatrixRepository @Inject constructor(
         }
     }
 
+    override suspend fun redactMessage(roomId: MatrixRoomId, eventId: String) {
+        withContext(dispatchers.io) {
+            if (activeTimelineRoomId != roomId.value) return@withContext
+            val timeline = activeTimeline ?: return@withContext
+            val raw = eventId.trim()
+            if (raw.isEmpty()) return@withContext
+            dropLocalMedia(roomId.value, raw)
+            sdkMapped[roomId.value] = sdkMapped[roomId.value].orEmpty()
+                .filter { it.eventId.value != raw }
+            publishTimeline(roomId.value)
+            val target = if (raw.startsWith("txn:")) {
+                EventOrTransactionId.TransactionId(raw.removePrefix("txn:"))
+            } else {
+                EventOrTransactionId.EventId(raw)
+            }
+            try {
+                timeline.redactEvent(target, null)
+            } catch (t: CancellationException) {
+                throw t
+            } catch (t: Throwable) {
+                Log.w("NgSend", "redact failed for $raw", t)
+            }
+        }
+    }
+
     override suspend fun paginateBack(roomId: MatrixRoomId): Boolean =
         withContext(dispatchers.io) {
             if (activeTimelineRoomId != roomId.value) return@withContext false
@@ -780,8 +844,220 @@ class DefaultMatrixRepository @Inject constructor(
     private fun timelineContains(roomId: String, eventId: String): Boolean =
         _timeline.value[roomId].orEmpty().any { it.eventId.value == eventId }
 
+    private fun dropLocalMedia(roomId: String, eventId: String) {
+        retainedMedia.remove(eventId)
+        backfilledMedia[roomId]?.remove(eventId)
+    }
+
+    private fun rememberPlayable(messages: List<TimelineMessage>) {
+        messages.forEach { msg ->
+            val playable = msg.contentKind == TimelineContentKind.Audio ||
+                msg.contentKind == TimelineContentKind.Video ||
+                msg.contentKind == TimelineContentKind.File
+            if (playable && (!msg.mediaSourceJson.isNullOrBlank() || !msg.mediaContentJson.isNullOrBlank())) {
+                retainedMedia[msg.eventId.value] = msg
+            }
+        }
+        if (retainedMedia.size > 400) {
+            retainedMedia.keys.take(120).forEach { retainedMedia.remove(it) }
+        }
+    }
+
+    private fun publishTimeline(roomId: String) {
+        val stitched = stitchPlayable(roomId, sdkMapped[roomId].orEmpty())
+        _timeline.update { it + (roomId to stitched) }
+        applyTimelinePreviewToRoomList(roomId, stitched)
+    }
+
+    private fun previewLineFor(message: TimelineMessage): String {
+        val who = if (message.isOwn) {
+            "You"
+        } else {
+            message.senderDisplayName?.takeIf { it.isNotBlank() }
+                ?: message.senderId.value.substringAfter("@").substringBefore(":")
+                    .ifBlank { message.senderId.value }
+        }
+        val body = message.body.lines().firstOrNull()?.trim().orEmpty().ifBlank {
+            when (message.contentKind) {
+                TimelineContentKind.Image -> "Photo"
+                TimelineContentKind.Video -> "Video"
+                TimelineContentKind.Audio -> if (message.isVoiceMessage) "Voice message" else "Audio"
+                TimelineContentKind.File -> "File"
+                TimelineContentKind.Sticker -> "Sticker"
+                else -> "Message"
+            }
+        }
+        return "$who: ${body.take(160)}"
+    }
+
+    private fun applyTimelinePreviewToRoomList(roomId: String, messages: List<TimelineMessage>) {
+        val last = messages.lastOrNull { !it.eventId.value.startsWith("txn:") } ?: return
+        val watching = roomId == activeConversationRoomIdValue
+        val readThrough = unreadHolds[roomId]?.readThroughTimestampMs
+        val unreadFromTimeline = if (!watching && readThrough != null) {
+            messages.count { msg ->
+                !msg.isOwn && !msg.eventId.value.startsWith("txn:") && msg.timestampMs > readThrough
+            }
+        } else {
+            null
+        }
+        val mentionsFromTimeline = if (!watching && readThrough != null) {
+            messages.count { msg ->
+                !msg.isOwn && msg.mentionsMe && msg.timestampMs > readThrough
+            }
+        } else {
+            null
+        }
+        _rooms.update { list ->
+            if (list.none { it.roomId.value == roomId }) return@update list
+            sortRoomSummaries(
+                list.map { room ->
+                    if (room.roomId.value != roomId) return@map room
+                    val newer = last.timestampMs >= (room.lastActivityTimestampMs ?: 0L)
+                    room.copy(
+                        subtitle = if (newer) previewLineFor(last) else room.subtitle,
+                        lastActivityTimestampMs = if (newer) last.timestampMs else room.lastActivityTimestampMs,
+                        unreadCount = when {
+                            watching -> 0
+                            unreadFromTimeline != null -> unreadFromTimeline
+                            else -> room.unreadCount
+                        },
+                        mentionCount = when {
+                            watching -> 0
+                            mentionsFromTimeline != null -> mentionsFromTimeline
+                            else -> room.mentionCount
+                        },
+                    )
+                },
+            )
+        }
+        if (!watching && unreadFromTimeline != null) {
+            unreadHolds[roomId] = UnreadHold(
+                watermark = unreadFromTimeline,
+                mentions = mentionsFromTimeline ?: 0,
+                readThroughTimestampMs = if (unreadFromTimeline == 0) readThrough else null,
+            )
+            persistUnreadHolds()
+        }
+    }
+
+    private fun applyIncomingPreviewToRoomList(item: IncomingNotification) {
+        ensureUnreadHoldsLoaded()
+        val ts = System.currentTimeMillis()
+        _rooms.update { list ->
+            if (list.none { it.roomId.value == item.roomId }) return@update list
+            sortRoomSummaries(
+                list.map { room ->
+                    if (room.roomId.value != item.roomId) return@map room
+                    val newer = ts >= (room.lastActivityTimestampMs ?: 0L)
+                    val readThrough = unreadHolds[item.roomId]?.readThroughTimestampMs
+                    val fresh = readThrough == null || ts > readThrough
+                    room.copy(
+                        subtitle = if (newer) "${item.senderName}: ${item.body.take(160)}" else room.subtitle,
+                        lastActivityTimestampMs = if (newer) ts else room.lastActivityTimestampMs,
+                        unreadCount = if (fresh) maxOf(room.unreadCount, 0) + 1 else 0,
+                        mentionCount = if (fresh && item.hasMention) {
+                            maxOf(room.mentionCount, 0) + 1
+                        } else {
+                            room.mentionCount
+                        },
+                    )
+                },
+            )
+        }
+        unreadHolds.compute(item.roomId) { _, existing ->
+            val readThrough = existing?.readThroughTimestampMs
+            if (readThrough != null && ts <= readThrough) {
+                existing.copy(watermark = 0, mentions = 0)
+            } else {
+                UnreadHold(
+                    watermark = maxOf(existing?.watermark ?: 0, 1),
+                    mentions = maxOf(existing?.mentions ?: 0, if (item.hasMention) 1 else 0),
+                    readThroughTimestampMs = null,
+                )
+            }
+        }
+        persistUnreadHolds()
+    }
+
+    private fun stitchPlayable(roomId: String, mapped: List<TimelineMessage>): List<TimelineMessage> {
+        val seen = mapped.mapTo(HashSet()) { it.eventId.value }
+        val extras = buildList {
+            backfilledMedia[roomId]?.values?.forEach { add(it) }
+            retainedMedia.values.forEach { msg ->
+                if (msg.roomId.value == roomId) add(msg)
+            }
+        }.filter { it.eventId.value !in seen }
+        if (extras.isEmpty()) return mapped
+        return (mapped + extras).sortedBy { it.timestampMs }
+    }
+
+    private fun backfillMissingMedia(client: Client, roomId: MatrixRoomId, ownUserId: String) {
+        val encRoom = URLEncoder.encode(roomId.value, Charsets.UTF_8.name())
+        val found = LinkedHashMap<String, TimelineMessage>()
+        fun ingest(event: JSONObject?) {
+            if (event == null) return
+            val msg = TimelineMessageMapper.messageFromClientEvent(roomId, ownUserId, event) ?: return
+            found[msg.eventId.value] = msg
+        }
+        runCatching {
+            val raw = authedGet(client, "/_matrix/client/v3/rooms/$encRoom/messages?dir=b&limit=80")
+            val chunk = raw?.let { JSONObject(it).optJSONArray("chunk") }
+            if (chunk != null) {
+                for (i in 0 until chunk.length()) ingest(chunk.optJSONObject(i))
+            }
+        }.onFailure { Log.w("NgTimeline", "messages backfill failed", it) }
+        val anchor = sdkMapped[roomId.value]
+            ?.asReversed()
+            ?.firstOrNull { it.eventId.value.startsWith("$") }
+            ?.eventId?.value
+        if (anchor != null) {
+            runCatching {
+                val encEvent = URLEncoder.encode(anchor, Charsets.UTF_8.name())
+                val raw = authedGet(
+                    client,
+                    "/_matrix/client/v3/rooms/$encRoom/context/$encEvent?limit=40",
+                ) ?: return@runCatching
+                val obj = JSONObject(raw)
+                ingest(obj.optJSONObject("event"))
+                obj.optJSONArray("events_before")?.let { arr ->
+                    for (i in 0 until arr.length()) ingest(arr.optJSONObject(i))
+                }
+                obj.optJSONArray("events_after")?.let { arr ->
+                    for (i in 0 until arr.length()) ingest(arr.optJSONObject(i))
+                }
+            }.onFailure { Log.w("NgTimeline", "context backfill failed", it) }
+        }
+        if (found.isEmpty()) {
+            Log.i("NgTimeline", "no extra media in ${roomId.value}")
+            return
+        }
+        val bucket = backfilledMedia.getOrPut(roomId.value) {
+            java.util.concurrent.ConcurrentHashMap()
+        }
+        found.values.forEach { msg ->
+            bucket[msg.eventId.value] = msg
+            retainedMedia[msg.eventId.value] = msg
+        }
+        Log.i(
+            "NgTimeline",
+            "stitched ${found.size} media event(s) into ${roomId.value}: " +
+                found.values.joinToString { "${it.contentKind} ${it.body.take(40)}" },
+        )
+        if (activeTimelineRoomId == roomId.value) {
+            publishTimeline(roomId.value)
+        }
+    }
+
     override fun setActiveConversation(roomId: String?) {
-        activeConversationRoomId = roomId
+        val previous = activeConversationRoomIdValue
+        _activeConversationRoomId.value = roomId
+        if (roomId == null && previous != null) {
+            applyTimelinePreviewToRoomList(previous, stitchPlayable(previous, sdkMapped[previous].orEmpty()))
+            scope.launch(dispatchers.io) {
+                mutex.withLock { syncService }?.let { subscribeToLiveRooms(it, previous) }
+            }
+        }
     }
 
     override suspend fun registerHttpPusher(pushkey: String) =
@@ -860,7 +1136,7 @@ class DefaultMatrixRepository @Inject constructor(
         roomId: String,
         ownUserId: String,
     ): IncomingNotification? {
-        if (roomId == activeConversationRoomId) return null
+        if (roomId == activeConversationRoomIdValue) return null
         val senderId = when (val ev = item.event) {
             is NotificationEvent.Timeline -> ev.event.senderId()
             is NotificationEvent.Invite -> ev.sender
@@ -923,8 +1199,11 @@ class DefaultMatrixRepository @Inject constructor(
     }
 
     private fun emitIncoming(item: IncomingNotification) {
-        if (item.roomId == activeConversationRoomId) return
+        if (item.roomId == activeConversationRoomIdValue) return
         if (item.jumpEventId == null && item.isReaction) return
+        if (activeTimelineRoomId != item.roomId && !item.isReaction) {
+            applyIncomingPreviewToRoomList(item)
+        }
         _incomingNotifications.tryEmit(item)
     }
 
@@ -998,7 +1277,7 @@ class DefaultMatrixRepository @Inject constructor(
     ): Boolean {
         val prefs = notificationPrefs
         if (!prefs.enabled) return false
-        if (item.roomId == activeConversationRoomId) return false
+        if (item.roomId == activeConversationRoomIdValue) return false
         if (item.isInvite) return true
         if (item.isReaction) {
             if (!prefs.reactions || reactionTargetId.isNullOrBlank()) return false
@@ -1696,7 +1975,12 @@ class DefaultMatrixRepository @Inject constructor(
                 ?.eventId
                 ?.value
             if (latestId == eid) {
-                markRoomReadLocally(roomId.value)
+                val readTs = _timeline.value[roomId.value]
+                    .orEmpty()
+                    .lastOrNull { it.eventId.value == eid }
+                    ?.timestampMs
+                    ?: System.currentTimeMillis()
+                markRoomReadLocally(roomId.value, readTs)
                 _rooms.update { list ->
                     list.map { room ->
                         if (room.roomId.value == roomId.value) {
@@ -1731,6 +2015,10 @@ class DefaultMatrixRepository @Inject constructor(
             syncService = sync
             client = c
         }
+        syncWanted.set(true)
+        syncErrorStreak = 0
+        syncAttachedAt.set(SystemClock.elapsedRealtime())
+        attachSyncRecovery(sync)
         sync.start()
         if (refetchTimelines) {
             runCatching {
@@ -1741,9 +2029,12 @@ class DefaultMatrixRepository @Inject constructor(
             }
         }
         startRoomListFromSyncLocked(sync)
-        runCatching { refreshRoomsFromClientLocked() }
+        if (_rooms.value.isEmpty()) {
+            runCatching { refreshRoomsFromClientLocked() }
+        }
         _isLoggedIn.value = true
         startRoomPollingLocked()
+        subscribeToLiveRooms(sync, null)
         runCatching { refreshAccount() }
         runCatching { ensureSessionVerificationController(c) }
         runCatching { attachSyncNotifications(c) }
@@ -1771,10 +2062,170 @@ class DefaultMatrixRepository @Inject constructor(
         roomPollJob?.cancel()
         roomPollJob = scope.launch {
             while (isActive && _isLoggedIn.value) {
-                runCatching { refreshRoomsFromClientLocked() }
-                delay(2500)
+                if (_rooms.value.isEmpty()) {
+                    runCatching { refreshRoomsFromClientLocked() }
+                }
+                delay(4000)
             }
         }
+    }
+
+    private val lastLiveSubscribeAt = AtomicLong(0)
+
+    private fun subscribeToLiveRooms(
+        sync: ClientSyncService,
+        primaryRoomId: String?,
+        force: Boolean = false,
+    ) {
+        val now = SystemClock.elapsedRealtime()
+        if (!force && now - lastLiveSubscribeAt.get() < 750 && primaryRoomId == null) return
+        lastLiveSubscribeAt.set(now)
+        val ids = buildList {
+            primaryRoomId?.let(::add)
+            activeTimelineRoomId?.let(::add)
+            _rooms.value.take(80).forEach { add(it.roomId.value) }
+        }.distinct()
+        if (ids.isEmpty()) return
+        scope.launch(dispatchers.io) {
+            runCatching { sync.roomListService().subscribeToRooms(ids) }
+                .onFailure { Log.w("NgSync", "subscribeToRooms failed", it) }
+        }
+    }
+
+    private var syncStateHandle: org.matrix.rustcomponents.sdk.TaskHandle? = null
+    private var syncWatchJob: Job? = null
+    private val syncWanted = AtomicBoolean(false)
+    private val syncAttachedAt = AtomicLong(0)
+    private val lastSyncKickAt = AtomicLong(0)
+
+    @Volatile
+    private var syncState: SyncServiceState = SyncServiceState.IDLE
+
+    @Volatile
+    private var syncErrorStreak: Int = 0
+
+    /**
+     * Sliding sync stops for good after a few failed long-polls. Watch the state,
+     * start it again, and drop a poisoned sync position if it keeps failing.
+     */
+    private fun attachSyncRecovery(sync: ClientSyncService) {
+        syncStateHandle?.cancel()
+        syncStateHandle = sync.state(object : SyncServiceStateObserver {
+            override fun onUpdate(state: SyncServiceState) {
+                syncState = state
+                Log.i("NgSync", "state=$state")
+                if (!syncWanted.get()) return
+                if (state == SyncServiceState.RUNNING) {
+                    syncErrorStreak = 0
+                    return
+                }
+                val warmingUp = SystemClock.elapsedRealtime() - syncAttachedAt.get() < 4_000L
+                if (warmingUp && state == SyncServiceState.IDLE) return
+                if (state == SyncServiceState.ERROR || state == SyncServiceState.TERMINATED) {
+                    scope.launch { kickSync("state-$state") }
+                }
+            }
+        })
+        syncWatchJob?.cancel()
+        syncWatchJob = scope.launch {
+            while (isActive && syncWanted.get()) {
+                delay(20_000)
+                if (!syncWanted.get()) return@launch
+                val state = syncState
+                if (state == SyncServiceState.RUNNING) {
+                    val live = mutex.withLock { syncService }
+                    live?.let { subscribeToLiveRooms(it, activeTimelineRoomId, force = true) }
+                    runCatching { refreshRoomPreviewsFromSdk() }
+                        .onFailure { Log.w("NgSync", "preview refresh failed", it) }
+                } else if (state != SyncServiceState.OFFLINE || appInForeground) {
+                    kickSync("watch-$state")
+                }
+            }
+        }
+    }
+
+    private suspend fun kickSync(reason: String) {
+        if (!syncWanted.get()) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastSyncKickAt.get() < 2_500L) return
+        lastSyncKickAt.set(now)
+        val sync = mutex.withLock { syncService } ?: return
+        val state = syncState
+        if (state == SyncServiceState.RUNNING) return
+        Log.w("NgSync", "restarting sync reason=$reason state=$state streak=$syncErrorStreak")
+        if (state == SyncServiceState.ERROR) {
+            syncErrorStreak += 1
+            if (syncErrorStreak >= 2) {
+                Log.w("NgSync", "dropping saved sliding-sync position")
+                runCatching { sync.stop() }
+                runCatching { sync.expireSessions() }
+                syncErrorStreak = 0
+            }
+        }
+        runCatching { sync.start() }
+            .onFailure { Log.w("NgSync", "sync.start failed", it) }
+        subscribeToLiveRooms(sync, activeTimelineRoomId, force = true)
+    }
+
+    private suspend fun refreshRoomPreviewsFromSdk() {
+        val sync = mutex.withLock { syncService } ?: return
+        val ids = _rooms.value.map { it.roomId.value }
+        if (ids.isEmpty()) return
+        val service = sync.roomListService()
+        val mapped = ids.mapNotNull { id ->
+            val room = runCatching { service.room(id) }.getOrNull() ?: return@mapNotNull null
+            try {
+                runCatching { mapSdkRoomToSummary(room) }.getOrNull()
+            } finally {
+                runCatching { room.close() }
+            }
+        }
+        if (mapped.isEmpty()) return
+        val incoming = mapped.associateBy { it.roomId.value }
+        _rooms.update { current ->
+            sortRoomSummaries(
+                current.map { existing ->
+                    incoming[existing.roomId.value]?.let { mergeRoomSummary(existing, it) } ?: existing
+                },
+            )
+        }
+    }
+
+    @Volatile
+    private var appInForeground: Boolean = false
+
+    private fun installForegroundSyncHook() {
+        val app = appContext as? Application ?: return
+        app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
+            private var started = 0
+            override fun onActivityStarted(activity: Activity) {
+                val becameVisible = started == 0
+                started += 1
+                appInForeground = true
+                if (becameVisible && syncWanted.get()) {
+                    scope.launch {
+                        val sync = mutex.withLock { syncService } ?: return@launch
+                        if (syncState == SyncServiceState.RUNNING) {
+                            subscribeToLiveRooms(sync, activeTimelineRoomId, force = true)
+                            runCatching { refreshRoomPreviewsFromSdk() }
+                        } else {
+                            kickSync("foreground")
+                        }
+                    }
+                }
+            }
+
+            override fun onActivityStopped(activity: Activity) {
+                started = (started - 1).coerceAtLeast(0)
+                appInForeground = started > 0
+            }
+
+            override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
+            override fun onActivityResumed(activity: Activity) = Unit
+            override fun onActivityPaused(activity: Activity) = Unit
+            override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
+            override fun onActivityDestroyed(activity: Activity) = Unit
+        })
     }
 
     /**
@@ -1794,6 +2245,12 @@ class DefaultMatrixRepository @Inject constructor(
     }
 
     private suspend fun closeClientLocked() {
+        syncWanted.set(false)
+        syncWatchJob?.cancel()
+        syncWatchJob = null
+        syncStateHandle?.cancel()
+        syncStateHandle = null
+        syncState = SyncServiceState.IDLE
         roomPollJob?.cancel()
         roomPollJob = null
         stopRoomListLocked()
@@ -1811,6 +2268,9 @@ class DefaultMatrixRepository @Inject constructor(
     }
 
     private fun stopTimelineLocked() {
+        activeTimelineRoomId?.let { id ->
+            applyTimelinePreviewToRoomList(id, stitchPlayable(id, sdkMapped[id].orEmpty()))
+        }
         timelineHandle?.cancel()
         timelineHandle = null
         runCatching { activeTimeline?.close() }
@@ -1833,7 +2293,7 @@ class DefaultMatrixRepository @Inject constructor(
         val rl = sync.roomListService().allRooms()
         roomList = rl
         val adapter = rl.entriesWithDynamicAdapters(
-            50u,
+            200u,
             object : RoomListEntriesListener {
                 override fun onUpdate(updates: List<RoomListEntriesUpdate>) {
                     scope.launch(dispatchers.io) {
@@ -1844,6 +2304,7 @@ class DefaultMatrixRepository @Inject constructor(
         )
         roomListAdapterResult = adapter
         adapter.controller().resetToOnePage()
+        repeat(3) { adapter.controller().addOnePage() }
         roomListStreamHandle = adapter.entriesStream()
     }
 
@@ -1854,7 +2315,14 @@ class DefaultMatrixRepository @Inject constructor(
                     val mapped = u.values
                         .filter { it.membership() == Membership.JOINED }
                         .mapNotNull { runCatching { mapSdkRoomToSummary(it) }.getOrNull() }
-                    _rooms.value = sortRoomSummaries(mapped)
+                    _rooms.update { cur ->
+                        val byId = cur.associateBy { it.roomId.value }
+                        sortRoomSummaries(
+                            mapped.map { incoming ->
+                                byId[incoming.roomId.value]?.let { mergeRoomSummary(it, incoming) } ?: incoming
+                            },
+                        )
+                    }
                 }
                 is RoomListEntriesUpdate.Append -> {
                     val mapped = u.values
@@ -1887,13 +2355,20 @@ class DefaultMatrixRepository @Inject constructor(
                     val summary = runCatching { mapSdkRoomToSummary(room) }.getOrNull() ?: continue
                     _rooms.update { cur ->
                         sortRoomSummaries(
-                            cur.map { if (it.roomId.value == summary.roomId.value) summary else it },
+                            cur.map { existing ->
+                                if (existing.roomId.value == summary.roomId.value) {
+                                    mergeRoomSummary(existing, summary)
+                                } else {
+                                    existing
+                                }
+                            },
                         )
                     }
                 }
                 else -> Unit
             }
         }
+        mutex.withLock { syncService }?.let { subscribeToLiveRooms(it, null) }
     }
 
     private suspend fun mapSdkRoomToSummary(room: Room): RoomSummary {
@@ -1907,7 +2382,8 @@ class DefaultMatrixRepository @Inject constructor(
                 RoomLatestEventPreview.summarize(ev, ownId)
             }
         }.getOrNull()
-        val unread = runCatching { unreadSnapshot(room) }.getOrDefault(UnreadSnapshot(0, 0))
+        val unread = runCatching { unreadSnapshot(room, lastLine?.timestampMs) }
+            .getOrDefault(UnreadSnapshot(0, 0))
         return RoomSummary(
             roomId = MatrixRoomId(room.id()),
             title = room.displayName() ?: room.id(),
@@ -1928,52 +2404,70 @@ class DefaultMatrixRepository @Inject constructor(
     private data class UnreadSnapshot(val unread: Int, val mentions: Int)
 
     /**
-     * @param ignoreAtOrAbove after this device marks the room read, ignore SDK
-     * counts that are still the pre-read backlog until the SDK drops below it.
+     * @param readThroughTimestampMs after this device marks the room read, ignore
+     * SDK leftovers for the same last event. A later timestamp is new activity.
      */
     private data class UnreadHold(
         val watermark: Int,
         val mentions: Int,
-        val ignoreAtOrAbove: Int?,
+        val readThroughTimestampMs: Long?,
     )
 
-    private fun holdUnread(roomId: String, unread: Int, mentions: Int): UnreadSnapshot {
+    private fun holdUnread(
+        roomId: String,
+        unread: Int,
+        mentions: Int,
+        latestTimestampMs: Long?,
+    ): UnreadSnapshot {
         ensureUnreadHoldsLoaded()
         val before = unreadHolds[roomId]
         val next = unreadHolds.compute(roomId) { _, existing ->
-            val ignore = existing?.ignoreAtOrAbove
+            val readThrough = existing?.readThroughTimestampMs
             when {
-                // A drop from 70 to 1 is the one-event window rebuilding, not the
-                // read receipt landing. Keep the badge clear until the count hits 0.
-                ignore != null && unread > 0 -> existing.copy(watermark = 0, mentions = 0)
-                ignore != null -> UnreadHold(0, 0, null)
-                // A transient 0 from that same window must not wipe a backlog
+                readThrough != null && (latestTimestampMs == null || latestTimestampMs <= readThrough) ->
+                    existing.copy(watermark = 0, mentions = 0)
+                readThrough != null && unread <= 0 -> UnreadHold(0, 0, null)
+                readThrough != null -> UnreadHold(maxOf(unread, 1), mentions, null)
+                // A transient 0 from the one-event window must not wipe a backlog
                 // we have already counted. Opening the room is what clears it.
                 unread == 0 -> existing ?: UnreadHold(0, 0, null)
                 else -> UnreadHold(
                     watermark = maxOf(existing?.watermark ?: 0, unread),
                     mentions = maxOf(existing?.mentions ?: 0, mentions),
-                    ignoreAtOrAbove = null,
+                    readThroughTimestampMs = null,
                 )
             }
         } ?: UnreadHold(unread, mentions, null)
         if (
             next.watermark != before?.watermark ||
             next.mentions != before.mentions ||
-            next.ignoreAtOrAbove != before.ignoreAtOrAbove
+            next.readThroughTimestampMs != before.readThroughTimestampMs
         ) {
             persistUnreadHolds()
         }
         return UnreadSnapshot(next.watermark, next.mentions)
     }
 
-    private fun markRoomReadLocally(roomId: String) {
+    private fun markRoomReadLocally(roomId: String, readThroughTimestampMs: Long) {
         ensureUnreadHoldsLoaded()
-        unreadHolds.compute(roomId) { _, existing ->
-            val floor = (existing?.watermark ?: 1).coerceAtLeast(1)
-            UnreadHold(watermark = 0, mentions = 0, ignoreAtOrAbove = floor)
-        }
+        unreadHolds[roomId] = UnreadHold(
+            watermark = 0,
+            mentions = 0,
+            readThroughTimestampMs = readThroughTimestampMs,
+        )
         persistUnreadHolds()
+    }
+
+    private fun mergeRoomSummary(existing: RoomSummary, incoming: RoomSummary): RoomSummary {
+        val incomingNewer =
+            (incoming.lastActivityTimestampMs ?: 0L) >= (existing.lastActivityTimestampMs ?: 0L)
+        return incoming.copy(
+            subtitle = if (incomingNewer) incoming.subtitle else existing.subtitle,
+            lastActivityTimestampMs = maxOf(
+                incoming.lastActivityTimestampMs ?: 0L,
+                existing.lastActivityTimestampMs ?: 0L,
+            ).takeIf { it > 0L },
+        )
     }
 
     private fun timelineLimitMarker(): File = File(appContext.filesDir, "matrix/active/timeline-limit-100")
@@ -2009,8 +2503,8 @@ class DefaultMatrixRepository @Inject constructor(
         synchronized(unreadHolds) {
             val json = JSONObject()
             unreadHolds.forEach { (id, hold) ->
-                val unread = if (hold.ignoreAtOrAbove != null) 0 else hold.watermark
-                val mentions = if (hold.ignoreAtOrAbove != null) 0 else hold.mentions
+                val unread = if (hold.readThroughTimestampMs != null) 0 else hold.watermark
+                val mentions = if (hold.readThroughTimestampMs != null) 0 else hold.mentions
                 if (unread <= 0 && mentions <= 0) return@forEach
                 json.put(id, JSONObject().put("u", unread).put("m", mentions))
             }
@@ -2022,7 +2516,7 @@ class DefaultMatrixRepository @Inject constructor(
         }
     }
 
-    private suspend fun unreadSnapshot(room: Room): UnreadSnapshot {
+    private suspend fun unreadSnapshot(room: Room, latestTimestampMs: Long?): UnreadSnapshot {
         val info = room.roomInfo()
         return try {
             // notificationCount / highlightCount are the homeserver's totals since the
@@ -2041,7 +2535,7 @@ class DefaultMatrixRepository @Inject constructor(
             val unread = (if (info.isMarkedUnread && base == 0L) 1L else base)
                 .coerceIn(0L, Int.MAX_VALUE.toLong())
                 .toInt()
-            holdUnread(room.id(), unread, mentions)
+            holdUnread(room.id(), unread, mentions, latestTimestampMs)
         } finally {
             runCatching { info.destroy() }
         }
@@ -2095,10 +2589,12 @@ class DefaultMatrixRepository @Inject constructor(
             .decryptionSettings(DecryptionSettings(TrustRequirement.UNTRUSTED))
             .requestConfig(
                 RequestConfig(
-                    timeout = 30_000uL,
-                    retryLimit = 3u,
+                    // Longer than a sliding-sync long-poll, short enough that a
+                    // dead socket does not sit for minutes before we retry.
+                    timeout = 60_000uL,
+                    retryLimit = 10u,
                     maxConcurrentRequests = null,
-                    maxRetryTime = null,
+                    maxRetryTime = 60_000uL,
                 ),
             )
     }

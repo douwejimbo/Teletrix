@@ -526,6 +526,7 @@ fun ConversationRoute(
         pendingComposeReply = pendingComposeReply,
         onClearComposeReply = viewModel::clearComposeReply,
         onReplyToMessage = viewModel::setComposeReply,
+        onDeleteMessage = viewModel::deleteMessage,
         modifier = modifier,
     )
 }

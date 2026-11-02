@@ -83,6 +83,7 @@ import androidx.compose.material.icons.outlined.AccountCircle
 import androidx.compose.material.icons.outlined.AttachFile
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.ContentCopy
+import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Keyboard
 import androidx.compose.material.icons.outlined.Mood
 import androidx.compose.material.icons.outlined.Videocam
@@ -151,6 +152,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import coil3.compose.AsyncImage
+import com.nextgenmatrix.core.model.MessageReaction
 import com.nextgenmatrix.core.model.RoomMemberBrief
 import com.nextgenmatrix.core.model.TimelineContentKind
 import com.nextgenmatrix.core.model.TimelineMessage
@@ -205,6 +207,7 @@ fun ConversationScreen(
     pendingComposeReply: PendingComposeReply? = null,
     onClearComposeReply: () -> Unit = {},
     onReplyToMessage: (TimelineMessage) -> Unit = {},
+    onDeleteMessage: (TimelineMessage) -> Unit = {},
     onSendSticker: (ByteArray, String, String) -> Unit = { _, _, _ -> },
     onMentionTagged: (RoomMemberBrief) -> Unit = {},
     onViewerPlaybackStarted: () -> Unit = {},
@@ -223,6 +226,7 @@ fun ConversationScreen(
     val clipboard = LocalClipboardManager.current
     var profileMember by remember(roomId) { mutableStateOf<RoomMemberBrief?>(null) }
     var actionTarget by remember(roomId) { mutableStateOf<TimelineMessage?>(null) }
+    var deleteTarget by remember(roomId) { mutableStateOf<TimelineMessage?>(null) }
     var viewer by remember(roomId) { mutableStateOf<ViewerState?>(null) }
     val displayState = rememberUpdatedState(display)
 
@@ -614,6 +618,31 @@ fun ConversationScreen(
                     }
                     actionTarget = null
                 },
+                onDelete = {
+                    actionTarget = null
+                    deleteTarget = target
+                },
+            )
+        }
+
+        deleteTarget?.let { target ->
+            AlertDialog(
+                onDismissRequest = { deleteTarget = null },
+                title = { Text("Delete message?") },
+                text = { Text("This removes the message for everyone in the room.") },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            deleteTarget = null
+                            onDeleteMessage(target)
+                        },
+                    ) {
+                        Text("Delete", color = MaterialTheme.colorScheme.error)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { deleteTarget = null }) { Text("Cancel") }
+                },
             )
         }
     }
@@ -886,6 +915,7 @@ private fun MessageActionSheet(
     onReply: () -> Unit,
     onOpenProfile: () -> Unit,
     onCopy: () -> Unit,
+    onDelete: () -> Unit,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val brief = remember(message.eventId, memberById) {
@@ -893,6 +923,7 @@ private fun MessageActionSheet(
     }
     val authorLine = if (message.isOwn) "You" else brief.displayName.ifBlank { brief.userId }
     val canReply = !message.eventId.value.startsWith("txn:")
+    val canDelete = message.isOwn && message.eventId.value.isNotBlank()
     val canCopy = message.body.isNotBlank() &&
         message.contentKind != TimelineContentKind.Image &&
         message.contentKind != TimelineContentKind.Sticker
@@ -943,6 +974,14 @@ private fun MessageActionSheet(
                     onClick = onCopy,
                 )
             }
+            if (canDelete) {
+                ActionRow(
+                    icon = Icons.Outlined.Delete,
+                    label = "Delete",
+                    onClick = onDelete,
+                    destructive = true,
+                )
+            }
         }
     }
 }
@@ -952,7 +991,18 @@ private fun ActionRow(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     label: String,
     onClick: () -> Unit,
+    destructive: Boolean = false,
 ) {
+    val tint = if (destructive) {
+        MaterialTheme.colorScheme.error
+    } else {
+        MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    val textColor = if (destructive) {
+        MaterialTheme.colorScheme.error
+    } else {
+        MaterialTheme.colorScheme.onSurface
+    }
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -964,9 +1014,9 @@ private fun ActionRow(
         Icon(
             imageVector = icon,
             contentDescription = null,
-            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            tint = tint,
         )
-        Text(label, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurface)
+        Text(label, style = MaterialTheme.typography.bodyLarge, color = textColor)
     }
 }
 
@@ -1264,6 +1314,12 @@ private fun MessageRow(
                     )
                 }
             }
+            if (message.reactions.isNotEmpty()) {
+                ReactionChipRow(
+                    reactions = message.reactions,
+                    outgoing = isOwn,
+                )
+            }
             ReadReceiptCluster(
                 userIds = message.readByUserIds,
                 memberById = memberById,
@@ -1296,6 +1352,50 @@ private fun senderNameColor(
     )
     val bucket = (message.senderId.value.hashCode().toLong() and Int.MAX_VALUE.toLong()).toInt() % palette.size
     return palette[bucket]
+}
+
+@Composable
+private fun ReactionChipRow(
+    reactions: List<MessageReaction>,
+    outgoing: Boolean,
+) {
+    val scheme = MaterialTheme.colorScheme
+    FlowRow(
+        modifier = Modifier.padding(top = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        reactions.forEach { reaction ->
+            val selected = reaction.includedMe
+            Surface(
+                shape = RoundedCornerShape(14.dp),
+                color = if (selected) {
+                    scheme.primary.copy(alpha = 0.22f)
+                } else {
+                    scheme.surfaceVariant.copy(alpha = 0.88f)
+                },
+                tonalElevation = if (selected) 2.dp else 0.dp,
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(
+                        text = reaction.key,
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                    if (reaction.count > 1) {
+                        Text(
+                            text = reaction.count.toString(),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (outgoing) scheme.onSurfaceVariant else scheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+    }
 }
 
 private const val ReceiptAvatarLimit = 4
@@ -1530,19 +1630,34 @@ private fun MessageBubbleBody(
         TimelineContentKind.Video ->
             MatrixVideoAttachment(message, media, bodyColor, metaColor, onOpen = open, onLongPress = longPress)
 
-        TimelineContentKind.Audio ->
-            MatrixAudioAttachment(
-                message = message,
-                media = media,
-                bodyColor = bodyColor,
-                metaColor = metaColor,
-                onPlayMusic = onPlayMusic,
-                isCurrentTrack = playingTrackId == message.eventId.value,
-                musicIsPlaying = musicIsPlaying && playingTrackId == message.eventId.value,
-                isPreparing = preparingTrackId == message.eventId.value,
-                onOpen = open,
-                onLongPress = longPress,
-            )
+        TimelineContentKind.Audio -> {
+            val caption = message.body.takeIf { body ->
+                body.isNotBlank() && !body.equals("Voice message", ignoreCase = true)
+            }
+            Column {
+                if (caption != null) {
+                    MessageTextWithPills(
+                        body = caption,
+                        bodyColor = bodyColor,
+                        metaColor = metaColor,
+                        memberById = memberById,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                }
+                MatrixAudioAttachment(
+                    message = message,
+                    media = media,
+                    bodyColor = bodyColor,
+                    metaColor = metaColor,
+                    onPlayMusic = onPlayMusic,
+                    isCurrentTrack = playingTrackId == message.eventId.value,
+                    musicIsPlaying = musicIsPlaying && playingTrackId == message.eventId.value,
+                    isPreparing = preparingTrackId == message.eventId.value,
+                    onOpen = open,
+                    onLongPress = longPress,
+                )
+            }
+        }
 
         TimelineContentKind.File ->
             FileAttachmentRow(message, bodyColor, metaColor, onOpen = open, onLongPress = longPress)
@@ -1651,11 +1766,9 @@ private fun MusicFileRow(
         )
         Column(Modifier.weight(1f)) {
             Text(
-                text = if (message.isVoiceMessage) {
-                    "Voice message"
-                } else {
-                    message.body.ifBlank { "Audio" }
-                },
+                text = message.mediaFileName?.takeIf { it.isNotBlank() }
+                    ?: message.body.takeIf { it.isNotBlank() && !it.equals("Voice message", ignoreCase = true) }
+                    ?: if (message.isVoiceMessage) "Voice message" else "Audio",
                 style = MaterialTheme.typography.bodyLarge,
                 color = bodyColor,
                 maxLines = 1,

@@ -88,7 +88,40 @@ class TeletrixNotifier @Inject constructor(
 
     fun clearRoom(roomId: String) {
         roomLines.remove(roomId)
-        NotificationManagerCompat.from(context).cancel(roomId.hashCode())
+        seen.removeIf { it.startsWith("$roomId|") }
+        val manager = context.getSystemService(NotificationManager::class.java)
+        val id = roomId.hashCode()
+        manager?.cancel(CHANNEL_MESSAGES, id)
+        NotificationManagerCompat.from(context).cancel(id)
+        if (Build.VERSION.SDK_INT >= 23) {
+            manager?.activeNotifications.orEmpty()
+                .filter { posted ->
+                    posted.id == id ||
+                        posted.notification.group == roomId ||
+                        posted.tag == roomId
+                }
+                .forEach { posted ->
+                    if (posted.tag != null) {
+                        manager?.cancel(posted.tag, posted.id)
+                    } else {
+                        manager?.cancel(posted.id)
+                    }
+                }
+        }
+    }
+
+    fun clearAllMessages() {
+        roomLines.clear()
+        seen.clear()
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return
+        if (Build.VERSION.SDK_INT >= 23) {
+            manager.activeNotifications.orEmpty()
+                .filter { it.notification.channelId == CHANNEL_MESSAGES || it.id != CONNECTION_NOTIFICATION_ID }
+                .forEach { posted ->
+                    if (posted.notification.channelId == CHANNEL_CONNECTION) return@forEach
+                    if (posted.tag != null) manager.cancel(posted.tag, posted.id) else manager.cancel(posted.id)
+                }
+        }
     }
 
     fun connectionNotification(): android.app.Notification {

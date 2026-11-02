@@ -232,6 +232,15 @@ class ConversationViewModel @Inject constructor(
         }
     }
 
+    fun deleteMessage(message: TimelineMessage) {
+        val room = _roomId.value ?: return
+        val eventId = message.eventId.value.trim()
+        if (eventId.isEmpty() || !message.isOwn) return
+        viewModelScope.launch {
+            matrixRepository.redactMessage(MatrixRoomId(room), eventId)
+        }
+    }
+
     fun sendSticker(roomId: String, bytes: ByteArray, fileName: String, mimeType: String) {
         viewModelScope.launch {
             _pendingReply.value = null

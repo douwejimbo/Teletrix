@@ -3,6 +3,7 @@ package com.nextgenmatrix.matrix.timeline
 import com.nextgenmatrix.core.model.MatrixEventId
 import com.nextgenmatrix.core.model.MatrixRoomId
 import com.nextgenmatrix.core.model.MatrixUserId
+import com.nextgenmatrix.core.model.MessageReaction
 import com.nextgenmatrix.core.model.TimelineContentKind
 import com.nextgenmatrix.core.model.TimelineMessage
 import org.matrix.rustcomponents.sdk.EmbeddedEventDetails
@@ -16,12 +17,16 @@ import org.matrix.rustcomponents.sdk.MessageType
 import org.matrix.rustcomponents.sdk.MsgLikeContent
 import org.matrix.rustcomponents.sdk.MsgLikeKind
 import org.matrix.rustcomponents.sdk.ProfileDetails
+import org.matrix.rustcomponents.sdk.MessageLikeEventType
 import org.matrix.rustcomponents.sdk.TimelineItem
 import org.matrix.rustcomponents.sdk.TimelineItemContent
 import org.matrix.rustcomponents.sdk.use
+import android.util.Log
+import org.json.JSONObject
 import java.net.URLDecoder
 
 internal object TimelineMessageMapper {
+    private const val TAG = "NgTimeline"
     fun mapItems(
         roomId: MatrixRoomId,
         ownUserId: String,
@@ -29,7 +34,9 @@ internal object TimelineMessageMapper {
     ): List<TimelineMessage> =
         items.mapNotNull { item ->
             val eventItem = item.asEvent() ?: return@mapNotNull null
-            mapEvent(roomId, ownUserId, eventItem)
+            runCatching { mapEvent(roomId, ownUserId, eventItem) }
+                .onFailure { Log.w(TAG, "mapEvent failed", it) }
+                .getOrNull()
         }
 
     /** Plain body line for room-list previews (reuses message mapping). */
@@ -44,7 +51,7 @@ internal object TimelineMessageMapper {
         val content = item.content
         if (content !is TimelineItemContent.MsgLike) return null
         val msgLike = content.content
-        val payload = extractPayloadFromMsgLike(msgLike, ownUserId) ?: return null
+        val payload = extractPayloadFromMsgLike(msgLike, ownUserId, item) ?: return null
         val reply = extractReplyQuote(msgLike, ownUserId)
         val threadRoot = msgLike.threadRoot?.takeIf { it.isNotBlank() }?.let { MatrixEventId(it) }
         val eventId = when (val id = item.eventOrTransactionId) {
@@ -88,8 +95,26 @@ internal object TimelineMessageMapper {
             mediaSizeBytes = payload.sizeBytes,
             threadRootEventId = threadRoot,
             latestForeignReactionMs = latestForeignReactionMs(msgLike, ownUserId),
+            reactions = mapReactions(msgLike, ownUserId),
         )
     }
+
+    private fun mapReactions(msgLike: MsgLikeContent, ownUserId: String): List<MessageReaction> =
+        msgLike.reactions
+            .asSequence()
+            .mapNotNull { reaction ->
+                val senders = reaction.senders
+                if (senders.isEmpty()) return@mapNotNull null
+                val key = reaction.key.trim()
+                if (key.isEmpty()) return@mapNotNull null
+                MessageReaction(
+                    key = key,
+                    count = senders.size,
+                    includedMe = senders.any { it.senderId == ownUserId },
+                )
+            }
+            .sortedByDescending { it.count }
+            .toList()
 
     private fun latestForeignReactionMs(msgLike: MsgLikeContent, ownUserId: String): Long? =
         msgLike.reactions
@@ -189,9 +214,15 @@ internal object TimelineMessageMapper {
         }
     }
 
-    private fun extractPayloadFromMsgLike(msgLike: MsgLikeContent, ownUserId: String): Payload? {
+    private fun extractPayloadFromMsgLike(
+        msgLike: MsgLikeContent,
+        ownUserId: String,
+        item: EventTimelineItem,
+    ): Payload? {
         return when (val kind = msgLike.kind) {
-            is MsgLikeKind.Message -> extractFromMessageContent(kind.content, ownUserId)
+            is MsgLikeKind.Message -> {
+                mergeMediaPayload(extractFromMessageContent(kind.content, ownUserId), recoverAudioFromItem(item))
+            }
             is MsgLikeKind.Sticker -> {
                 val src = encodeMediaSource(kind.source)
                 val mime = kind.info?.mimetype
@@ -204,12 +235,22 @@ internal object TimelineMessageMapper {
                     animated = kind.info?.isAnimated == true || isAnimatedMime(mime),
                 )
             }
-            is MsgLikeKind.UnableToDecrypt -> Payload("🔒 Encrypted message", TimelineContentKind.Other)
+            is MsgLikeKind.UnableToDecrypt ->
+                recoverAudioFromItem(item) ?: Payload("🔒 Encrypted message", TimelineContentKind.Other)
             is MsgLikeKind.Poll -> Payload("📊 Poll", TimelineContentKind.Other)
-            is MsgLikeKind.Redacted -> Payload("Message removed", TimelineContentKind.Other)
-            is MsgLikeKind.Other -> Payload("[${kind.eventType}]", TimelineContentKind.Other)
+            is MsgLikeKind.Redacted -> recoverAudioFromItem(item)
+            is MsgLikeKind.Other -> when (kind.eventType) {
+                is MessageLikeEventType.Voice,
+                is MessageLikeEventType.Audio,
+                -> recoverAudioFromItem(item)
+                    ?: Payload("Voice message", TimelineContentKind.Audio, isVoice = true)
+                is MessageLikeEventType.File -> recoverAudioFromItem(item)
+                    ?: Payload("Attachment", TimelineContentKind.File)
+                else -> recoverAudioFromItem(item)
+                    ?: Payload("[${kind.eventType}]", TimelineContentKind.Other)
+            }
             is MsgLikeKind.LiveLocation -> Payload("📍 Live location", TimelineContentKind.Other)
-            else -> null
+            else -> recoverAudioFromItem(item)
         }
     }
 
@@ -304,19 +345,34 @@ internal object TimelineMessageMapper {
             }
             is MessageType.File -> {
                 val f = mt.content
-                val label = when {
-                    !f.filename.isNullOrBlank() -> f.filename!!.trim()
-                    else -> "Attachment"
-                }
+                val mime = f.info?.mimetype
+                val name = f.filename?.takeIf { it.isNotBlank() }
+                val audio = isAudioMime(mime) || looksLikeAudioName(name)
+                val label = name ?: if (audio) "Audio" else "Attachment"
                 Payload(
-                    body = "📎 $label",
-                    kind = TimelineContentKind.File,
+                    body = if (audio) label else "📎 $label",
+                    kind = if (audio) TimelineContentKind.Audio else TimelineContentKind.File,
                     mediaJson = encodeMediaSource(f.source),
-                    mime = f.info?.mimetype,
+                    mime = mime,
                     mentionsMe = mentionsMe,
-                    fileName = f.filename?.takeIf { it.isNotBlank() },
+                    fileName = name,
                     sizeBytes = f.info?.size?.toLong(),
+                    isVoice = audio && (name?.contains("voice", ignoreCase = true) == true),
                 )
+            }
+            is MessageType.Other -> {
+                val audio = mt.msgtype.contains("audio", ignoreCase = true) ||
+                    mt.msgtype.contains("voice", ignoreCase = true)
+                if (audio) {
+                    Payload(
+                        body = mt.body.ifBlank { "Voice message" },
+                        kind = TimelineContentKind.Audio,
+                        isVoice = mt.msgtype.contains("voice", ignoreCase = true),
+                        mentionsMe = mentionsMe,
+                    )
+                } else {
+                    Payload(mt.body.ifBlank { "[${mt.msgtype}]" }, TimelineContentKind.Other, mentionsMe = mentionsMe)
+                }
             }
             is MessageType.Location -> Payload("📍 Location", TimelineContentKind.Other, mentionsMe = mentionsMe)
             is MessageType.Gallery -> Payload("🖼 Gallery", TimelineContentKind.Other, mentionsMe = mentionsMe)
@@ -387,8 +443,158 @@ internal object TimelineMessageMapper {
 
     private fun encodeMediaSource(source: MediaSource?): String? {
         if (source == null) return null
+        // Do not destroy the timeline-owned source; later diffs remap the same item.
+        return runCatching { source.toJson() }.getOrNull()
+    }
+
+    private fun mergeMediaPayload(mapped: Payload, media: Payload?): Payload {
+        if (media == null) return mapped
+        val keepBody = mapped.body.takeIf { body ->
+            body.isNotBlank() &&
+                !body.startsWith("[") &&
+                !body.equals("Message removed", ignoreCase = true)
+        }
+        return when (mapped.kind) {
+            TimelineContentKind.Text, TimelineContentKind.Other ->
+                media.copy(body = keepBody ?: media.body)
+            TimelineContentKind.Audio, TimelineContentKind.File, TimelineContentKind.Video ->
+                mapped.copy(
+                    mediaJson = mapped.mediaJson ?: media.mediaJson,
+                    contentJson = mapped.contentJson ?: media.contentJson,
+                    durationMs = mapped.durationMs ?: media.durationMs,
+                    mime = mapped.mime ?: media.mime,
+                    fileName = mapped.fileName ?: media.fileName,
+                    sizeBytes = mapped.sizeBytes ?: media.sizeBytes,
+                    isVoice = mapped.isVoice || media.isVoice,
+                    kind = if (mapped.kind == TimelineContentKind.File && media.kind == TimelineContentKind.Audio) {
+                        TimelineContentKind.Audio
+                    } else {
+                        mapped.kind
+                    },
+                )
+            else -> mapped
+        }
+    }
+
+    private fun recoverAudioFromItem(item: EventTimelineItem): Payload? {
+        val blobs = listOf(
+            runCatching { item.lazyProvider.latestJson() }.getOrNull(),
+            runCatching { item.lazyProvider.debugInfo().latestEditJson }.getOrNull(),
+            runCatching { item.lazyProvider.debugInfo().originalJson }.getOrNull(),
+        )
+        return blobs.firstNotNullOfOrNull { parseAudioPayload(it) }
+    }
+
+    /**
+     * Builds a timeline row from a raw `/messages` or `/context` client event.
+     * Used to stitch media the sliding-sync extras omitted from the local cache.
+     */
+    internal fun messageFromClientEvent(
+        roomId: MatrixRoomId,
+        ownUserId: String,
+        event: JSONObject,
+    ): TimelineMessage? {
+        val eventId = event.optString("event_id").takeIf { it.isNotBlank() } ?: return null
+        val sender = event.optString("sender").takeIf { it.isNotBlank() } ?: return null
+        val ts = event.optLong("origin_server_ts").takeIf { it > 0 } ?: return null
+        val content = event.optJSONObject("content") ?: JSONObject()
+        val payload = parsePlayablePayload(event.optString("type"), content) ?: return null
+        if (payload.mediaJson.isNullOrBlank()) return null
+        return TimelineMessage(
+            eventId = MatrixEventId(eventId),
+            roomId = roomId,
+            senderId = MatrixUserId(sender),
+            senderDisplayName = sender.substringAfter("@").substringBefore(":").ifBlank { sender },
+            senderAvatarMxc = null,
+            body = payload.body,
+            timestampMs = ts,
+            isOwn = sender == ownUserId,
+            contentKind = payload.kind,
+            mediaSourceJson = payload.mediaJson,
+            mediaContentJson = payload.contentJson,
+            mediaDurationMs = payload.durationMs,
+            mediaMimeType = payload.mime,
+            isVoiceMessage = payload.isVoice,
+            mediaFileName = payload.fileName,
+            mediaSizeBytes = payload.sizeBytes,
+        )
+    }
+
+    private fun parseAudioPayload(raw: String?): Payload? {
+        if (raw.isNullOrBlank()) return null
         return runCatching {
-            source.use { it.toJson() }
+            val obj = JSONObject(raw)
+            val content = obj.optJSONObject("content") ?: return@runCatching null
+            parsePlayablePayload(obj.optString("type"), content)
         }.getOrNull()
+    }
+
+    private fun parsePlayablePayload(type: String, content: JSONObject): Payload? {
+        val msgtype = content.optString("msgtype")
+        val file = content.optJSONObject("file")
+        val mscFile = content.optJSONObject("org.matrix.msc1767.file")
+        val url = content.optString("url").ifBlank {
+            file?.optString("url").orEmpty()
+        }.ifBlank {
+            mscFile?.optString("url").orEmpty()
+        }
+        val info = content.optJSONObject("info")
+        val mime = info?.optString("mimetype").orEmpty()
+            .ifBlank { mscFile?.optString("mimetype").orEmpty() }
+        val filename = content.optString("filename").ifBlank {
+            mscFile?.optString("name").orEmpty()
+        }.takeIf { it.isNotBlank() }
+        val body = content.optString("body")
+        val voice = content.has("org.matrix.msc3245.voice") ||
+            content.has("org.matrix.msc2516.voice") ||
+            type.contains("voice", ignoreCase = true) ||
+            msgtype.contains("voice", ignoreCase = true)
+        val duration = info?.optLong("duration")?.takeIf { it > 0 }
+            ?: content.optJSONObject("org.matrix.msc1767.audio")?.optLong("duration")?.takeIf { it > 0 }
+        val video = msgtype == "m.video" || type == "m.video" || mime.startsWith("video/")
+        val audio = !video && (
+            voice ||
+                isAudioMime(mime) ||
+                msgtype == "m.audio" ||
+                type == "m.audio" ||
+                type.contains("voice", ignoreCase = true) ||
+                looksLikeAudioName(filename ?: body) ||
+                (msgtype == "m.file" && duration != null)
+            )
+        if (!audio && !video) return null
+        val mediaJson = when {
+            file != null && file.optString("url").isNotBlank() -> file.toString()
+            url.isNotBlank() -> runCatching { MediaSource.fromUrl(url).use { it.toJson() } }.getOrNull()
+                ?: """{"url":${JSONObject.quote(url)}}"""
+            else -> null
+        }
+        val kind = if (audio) TimelineContentKind.Audio else TimelineContentKind.Video
+        return Payload(
+            body = when {
+                body.isNotBlank() && !body.equals("Voice message", ignoreCase = true) -> body
+                voice -> "Voice message"
+                filename != null -> filename
+                audio -> "Audio"
+                else -> "Video"
+            },
+            kind = kind,
+            mediaJson = mediaJson,
+            contentJson = mediaJson,
+            durationMs = duration,
+            mime = mime.ifBlank { null },
+            isVoice = voice,
+            fileName = filename,
+            sizeBytes = info?.optLong("size")?.takeIf { it > 0 },
+        )
+    }
+
+    private fun isAudioMime(mime: String?): Boolean =
+        mime?.lowercase()?.startsWith("audio/") == true
+
+    private fun looksLikeAudioName(name: String?): Boolean {
+        val n = name?.lowercase().orEmpty()
+        return n.endsWith(".ogg") || n.endsWith(".mp3") || n.endsWith(".m4a") ||
+            n.endsWith(".opus") || n.endsWith(".wav") || n.endsWith(".flac") ||
+            n.contains("voice")
     }
 }
