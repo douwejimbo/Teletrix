@@ -61,4 +61,4 @@ The APK is written to `app/build/outputs/apk/release/app-release.apk`.
 | `:data:media` | Playback service for audio in chats |
 | `:data:push` | Placeholder for a UnifiedPush distributor. Push delivery is not wired up yet |
 
-Application id: `com.nextgenmatrix.app`. Version 0.1.0.
+Application id: `com.nextgenmatrix.app`. Version 0.2.0.

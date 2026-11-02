@@ -2579,7 +2579,7 @@ class DefaultMatrixRepository @Inject constructor(
         return ClientBuilder()
             .sqliteStore(sqlite)
             .setSessionDelegate(delegate)
-            .userAgent("Teletrix/0.1.0")
+            .userAgent("Teletrix/0.2.0")
             .autoEnableBackups(true)
             .autoEnableCrossSigning(true)
             .enableShareHistoryOnInvite(true)
