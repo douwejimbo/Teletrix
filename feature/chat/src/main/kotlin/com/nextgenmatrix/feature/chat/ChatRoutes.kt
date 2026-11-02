@@ -470,6 +470,8 @@ fun ConversationRoute(
     val preparingTrackId by viewModel.preparingTrackId.collectAsStateWithLifecycle()
     val membersMap by viewModel.roomMembersByRoom.collectAsStateWithLifecycle()
     val roomMembers = membersMap[roomId].orEmpty()
+    val mentionWatermarkMs by viewModel.mentionWatermarkMs.collectAsStateWithLifecycle()
+    val reactionWatermarkMs by viewModel.reactionWatermarkMs.collectAsStateWithLifecycle()
 
     val media = remember(viewModel) {
         MatrixChatMedia(
@@ -517,9 +519,14 @@ fun ConversationRoute(
         jumpToEventId = jumpToEventId,
         onConsumeJumpToEvent = viewModel::consumeJumpToEvent,
         onJumpToReply = viewModel::jumpToReply,
+        mentionWatermarkMs = mentionWatermarkMs,
+        reactionWatermarkMs = reactionWatermarkMs,
+        onMentionRead = viewModel::markMentionRead,
+        onReactionRead = viewModel::markReactionRead,
         pendingComposeReply = pendingComposeReply,
         onClearComposeReply = viewModel::clearComposeReply,
         onReplyToMessage = viewModel::setComposeReply,
+        onDeleteMessage = viewModel::deleteMessage,
         modifier = modifier,
     )
 }

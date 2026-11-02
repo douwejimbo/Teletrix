@@ -10,10 +10,13 @@ import androidx.media3.session.SessionToken
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -29,9 +32,12 @@ class Media3ChatMusicPlayer @Inject constructor(
 
     private var controller: MediaController? = null
     private var connecting: kotlinx.coroutines.CompletableDeferred<MediaController>? = null
+    private var metaById: Map<String, MusicTrack> = emptyMap()
+    private var ticker: Job? = null
 
     override fun play(tracks: List<MusicTrack>, startIndex: Int) {
         if (tracks.isEmpty()) return
+        metaById = tracks.associateBy { it.id }
         mainScope.launch {
             val c = awaitController()
             val index = startIndex.coerceIn(0, tracks.lastIndex)
@@ -39,11 +45,13 @@ class Media3ChatMusicPlayer @Inject constructor(
             c.prepare()
             c.play()
             publish(c)
+            startTicker()
         }
     }
 
     override fun replaceQueue(tracks: List<MusicTrack>, currentId: String) {
         if (tracks.isEmpty()) return
+        metaById = tracks.associateBy { it.id }
         mainScope.launch {
             val c = awaitController()
             val index = tracks.indexOfFirst { it.id == currentId }.coerceAtLeast(0)
@@ -89,11 +97,37 @@ class Media3ChatMusicPlayer @Inject constructor(
         }
     }
 
+    override fun seekTo(positionMs: Long) {
+        mainScope.launch {
+            val c = controller ?: return@launch
+            c.seekTo(positionMs.coerceAtLeast(0L))
+            publish(c)
+        }
+    }
+
+    override fun stop() {
+        mainScope.launch {
+            ticker?.cancel()
+            ticker = null
+            val c = controller ?: return@launch
+            c.stop()
+            c.clearMediaItems()
+            _nowPlaying.value = null
+        }
+    }
+
     private fun toItem(track: MusicTrack): MediaItem =
         MediaItem.Builder()
             .setUri(track.uri)
             .setMediaId(track.id)
-            .setMediaMetadata(MediaMetadata.Builder().setTitle(track.title).build())
+            .setMediaMetadata(
+                MediaMetadata.Builder()
+                    .setTitle(track.title)
+                    .setArtist(track.subtitle)
+                    .setIsBrowsable(false)
+                    .setIsPlayable(true)
+                    .build(),
+            )
             .build()
 
     private suspend fun awaitController(): MediaController {
@@ -126,6 +160,7 @@ class Media3ChatMusicPlayer @Inject constructor(
             object : Player.Listener {
                 override fun onIsPlayingChanged(isPlaying: Boolean) {
                     publish(player)
+                    if (isPlaying) startTicker() else ticker?.cancel()
                 }
 
                 override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
@@ -134,21 +169,45 @@ class Media3ChatMusicPlayer @Inject constructor(
 
                 override fun onPlaybackStateChanged(playbackState: Int) {
                     publish(player)
+                    if (playbackState == Player.STATE_ENDED) {
+                        ticker?.cancel()
+                    }
                 }
             },
         )
     }
 
+    private fun startTicker() {
+        if (ticker?.isActive == true) return
+        ticker = mainScope.launch {
+            while (isActive) {
+                controller?.let(::publish)
+                delay(400)
+            }
+        }
+    }
+
     private fun publish(player: Player) {
         val item = player.currentMediaItem
-        if (item == null || player.playbackState == Player.STATE_IDLE || player.playbackState == Player.STATE_ENDED) {
+        if (item == null || player.playbackState == Player.STATE_IDLE) {
             _nowPlaying.value = null
             return
         }
+        if (player.playbackState == Player.STATE_ENDED && !player.playWhenReady) {
+            _nowPlaying.value = null
+            return
+        }
+        val meta = metaById[item.mediaId]
         _nowPlaying.value = NowPlaying(
             trackId = item.mediaId,
-            title = item.mediaMetadata.title?.toString().orEmpty().ifBlank { "Audio" },
+            title = item.mediaMetadata.title?.toString()
+                .orEmpty()
+                .ifBlank { meta?.title ?: "Audio" },
             isPlaying = player.isPlaying,
+            positionMs = player.currentPosition.coerceAtLeast(0L),
+            durationMs = player.duration.takeIf { it > 0 } ?: 0L,
+            subtitle = meta?.subtitle ?: item.mediaMetadata.artist?.toString(),
+            isVoice = meta?.isVoice == true,
         )
     }
 }

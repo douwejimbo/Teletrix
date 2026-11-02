@@ -278,10 +278,16 @@ private fun AppRoot() {
                         if (showMiniPlayer) {
                             MiniPlayerBar(
                                 title = nowPlaying?.title.orEmpty(),
+                                subtitle = nowPlaying?.subtitle,
                                 isPlaying = nowPlaying?.isPlaying == true,
+                                isVoice = nowPlaying?.isVoice == true,
+                                positionMs = nowPlaying?.positionMs ?: 0L,
+                                durationMs = nowPlaying?.durationMs ?: 0L,
                                 onToggle = musicVm::toggle,
                                 onPrevious = musicVm::previous,
                                 onNext = musicVm::next,
+                                onSeek = musicVm::seekTo,
+                                onStop = musicVm::stop,
                             )
                         }
                         if (showTabs) {

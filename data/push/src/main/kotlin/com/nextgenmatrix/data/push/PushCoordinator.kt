@@ -50,6 +50,11 @@ class PushCoordinator @Inject constructor(
             matrix.incomingNotifications.collect { notifier.show(it) }
         }
         scope.launch {
+            matrix.activeConversationRoomId.collect { roomId ->
+                if (roomId != null) notifier.clearRoom(roomId)
+            }
+        }
+        scope.launch {
             notifyPrefs.value.collect { next ->
                 matrix.setNotificationPrefs(next)
                 if (matrix.isLoggedIn.value) {
@@ -119,6 +124,7 @@ class PushCoordinator @Inject constructor(
 
     private fun onSignedOut() {
         unifiedPushReady = false
+        notifier.clearAllMessages()
         runCatching { UnifiedPush.unregister(context) }
         stopNtfy()
         prefs.edit().clear().apply()

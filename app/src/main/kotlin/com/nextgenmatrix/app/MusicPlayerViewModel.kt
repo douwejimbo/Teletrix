@@ -18,4 +18,8 @@ class MusicPlayerViewModel @Inject constructor(
     fun next() = player.next()
 
     fun previous() = player.previous()
+
+    fun seekTo(positionMs: Long) = player.seekTo(positionMs)
+
+    fun stop() = player.stop()
 }
