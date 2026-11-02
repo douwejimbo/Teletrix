@@ -520,9 +520,9 @@ class DefaultMatrixRepository @Inject constructor(
                     // A fresh sign-in always starts from an empty store. Reusing a crypto store
                     // that belongs to an earlier session gives this device keys that disagree
                     // with the server, and other clients then reject our verification MAC.
-                    // The saved session belonged to that store, so it is dropped together with it.
+                    // The access token stays until the new client actually starts, so a failed
+                    // discovery does not sign the user out.
                     runCatching { File(appContext.filesDir, "matrix/active").deleteRecursively() }
-                    sessionStore.markInvalidAndClearActive(false)
                     val paths = newSessionPaths()
                     sessionPaths = paths
                     val builder = newBuilderForDiscovery(paths).serverNameOrHomeserverUrl(serverOrName)
@@ -531,6 +531,7 @@ class DefaultMatrixRepository @Inject constructor(
                     } finally {
                         builder.close()
                     }
+                    sessionStore.markInvalidAndClearActive(false)
                     client = c
                     c.homeserverLoginDetails().use { details ->
                         HomeserverLoginDetails(
