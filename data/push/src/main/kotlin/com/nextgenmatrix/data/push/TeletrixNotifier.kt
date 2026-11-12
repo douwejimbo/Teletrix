@@ -13,6 +13,7 @@ import androidx.core.app.Person
 import androidx.core.content.ContextCompat
 import com.nextgenmatrix.core.model.IncomingNotification
 import dagger.hilt.android.qualifiers.ApplicationContext
+import java.util.LinkedHashSet
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -21,8 +22,9 @@ import javax.inject.Singleton
 class TeletrixNotifier @Inject constructor(
     @ApplicationContext private val context: Context,
 ) {
-    private val seen = ConcurrentHashMap.newKeySet<String>()
+    private val seen = loadSeen()
     private val roomLines = ConcurrentHashMap<String, MutableList<String>>()
+    private val seenPrefs = context.getSharedPreferences(SEEN_PREFS, Context.MODE_PRIVATE)
 
     fun ensureChannels() {
         if (Build.VERSION.SDK_INT < 26) return
@@ -42,9 +44,11 @@ class TeletrixNotifier @Inject constructor(
     }
 
     fun show(item: IncomingNotification) {
+        if (item.eventId.isBlank()) return
         val key = "${item.roomId}|${item.eventId}"
-        if (item.eventId.isNotBlank() && !seen.add(key)) return
-        if (seen.size > 400) seen.clear()
+        if (!remember(key)) return
+        val sentAt = item.eventTimestampMs
+        if (sentAt > 0L && System.currentTimeMillis() - sentAt > MAX_NOTIFICATION_AGE_MS) return
         ensureChannels()
         val lines = roomLines.getOrPut(item.roomId) { mutableListOf() }
         val line = if (item.isDirect) item.body else "${item.senderName}: ${item.body}"
@@ -71,7 +75,7 @@ class TeletrixNotifier @Inject constructor(
                 if (item.noisy) NotificationCompat.PRIORITY_HIGH else NotificationCompat.PRIORITY_DEFAULT,
             )
             .setAutoCancel(true)
-            .setOnlyAlertOnce(false)
+            .setOnlyAlertOnce(true)
             .setGroup(item.roomId)
             .setContentIntent(openRoomIntent(item.roomId, item.jumpEventId ?: item.eventId))
             .setColor(ContextCompat.getColor(context, android.R.color.holo_blue_dark))
@@ -88,7 +92,6 @@ class TeletrixNotifier @Inject constructor(
 
     fun clearRoom(roomId: String) {
         roomLines.remove(roomId)
-        seen.removeIf { it.startsWith("$roomId|") }
         val manager = context.getSystemService(NotificationManager::class.java)
         val id = roomId.hashCode()
         manager?.cancel(CHANNEL_MESSAGES, id)
@@ -112,7 +115,10 @@ class TeletrixNotifier @Inject constructor(
 
     fun clearAllMessages() {
         roomLines.clear()
-        seen.clear()
+        synchronized(seen) {
+            seen.clear()
+            seenPrefs.edit().remove(SEEN_KEY).apply()
+        }
         val manager = context.getSystemService(NotificationManager::class.java) ?: return
         if (Build.VERSION.SDK_INT >= 23) {
             manager.activeNotifications.orEmpty()
@@ -129,7 +135,7 @@ class TeletrixNotifier @Inject constructor(
         return NotificationCompat.Builder(context, CHANNEL_CONNECTION)
             .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setContentTitle("Teletrix")
-            .setContentText("Notifications on")
+            .setContentText("Keeping chats up to date")
             .setOngoing(true)
             .setSilent(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
@@ -158,6 +164,25 @@ class TeletrixNotifier @Inject constructor(
         )
     }
 
+    private fun loadSeen(): MutableSet<String> {
+        val raw = context.getSharedPreferences(SEEN_PREFS, Context.MODE_PRIVATE)
+            .getString(SEEN_KEY, "")
+            .orEmpty()
+        return LinkedHashSet(raw.lineSequence().filter { it.isNotBlank() }.toList())
+    }
+
+    private fun remember(key: String): Boolean {
+        synchronized(seen) {
+            if (!seen.add(key)) return false
+            while (seen.size > 400) {
+                val oldest = seen.firstOrNull() ?: break
+                seen.remove(oldest)
+            }
+            seenPrefs.edit().putString(SEEN_KEY, seen.joinToString("\n")).apply()
+            return true
+        }
+    }
+
     private fun openAppIntent(): PendingIntent {
         val intent = Intent().apply {
             setClassName(context.packageName, "com.nextgenmatrix.app.MainActivity")
@@ -175,5 +200,8 @@ class TeletrixNotifier @Inject constructor(
         const val CHANNEL_MESSAGES = "messages"
         const val CHANNEL_CONNECTION = "connection"
         const val CONNECTION_NOTIFICATION_ID = 71
+        private const val SEEN_PREFS = "teletrix_seen_events"
+        private const val SEEN_KEY = "ids"
+        private const val MAX_NOTIFICATION_AGE_MS = 30 * 60 * 1000L
     }
 }

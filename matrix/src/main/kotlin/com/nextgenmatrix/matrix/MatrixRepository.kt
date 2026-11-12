@@ -569,6 +569,13 @@ class DefaultMatrixRepository @Inject constructor(
 
     override suspend fun restoreSession(): Result<Unit> =
         withContext(dispatchers.io) {
+            val live = mutex.withLock { client }
+            if (live != null && _isLoggedIn.value) {
+                // Opening the app must not tear down a client that is already
+                // signed in. Rebuilding it here deadlocks the store and sync stops.
+                kickSync("already-live", force = true)
+                return@withContext Result.success(Unit)
+            }
             runCatching {
                 val session = sessionStore.readPersistedSession() ?: error("No session")
                 val c = mutex.withLock {
@@ -1081,7 +1088,11 @@ class DefaultMatrixRepository @Inject constructor(
                 profileTag = null,
                 lang = "en",
             )
+            val previous = registeredPushkey
             registeredPushkey = key
+            if (previous != null && previous != key) {
+                runCatching { c.deletePusher(PusherIdentifiers(previous, pusherAppId)) }
+            }
         }
 
     override suspend fun unregisterHttpPusher() =
@@ -1171,8 +1182,14 @@ class DefaultMatrixRepository @Inject constructor(
             isReaction = reaction != null,
             jumpEventId = reaction?.eventId,
             reactionKey = reaction?.key,
+            eventTimestampMs = originServerTs(item.rawEvent),
         )
         return if (shouldNotify(mapped, ownUserId, reaction?.eventId, roomId)) mapped else null
+    }
+
+    private fun originServerTs(raw: String?): Long {
+        if (raw.isNullOrBlank()) return 0L
+        return runCatching { JSONObject(raw).optLong("origin_server_ts", 0L) }.getOrDefault(0L)
     }
 
     private fun bodyFromRawEvent(raw: String?): String {
@@ -1205,7 +1222,11 @@ class DefaultMatrixRepository @Inject constructor(
         if (activeTimelineRoomId != item.roomId && !item.isReaction) {
             applyIncomingPreviewToRoomList(item)
         }
-        _incomingNotifications.tryEmit(item)
+        // Catch-up after the app is opened updates the list. It must not
+        // repost every message that arrived while sync was down.
+        if (!appInForeground) {
+            _incomingNotifications.tryEmit(item)
+        }
     }
 
     override fun setNotificationPrefs(prefs: NotificationPrefs) {
@@ -1329,6 +1350,7 @@ class DefaultMatrixRepository @Inject constructor(
                 isReaction = true,
                 jumpEventId = reaction.eventId,
                 reactionKey = reaction.key,
+                eventTimestampMs = runCatching { ev.timestamp().toLong() }.getOrDefault(0L),
             )
         } finally {
             runCatching { ev.destroy() }
@@ -2017,7 +2039,6 @@ class DefaultMatrixRepository @Inject constructor(
             client = c
         }
         syncWanted.set(true)
-        syncErrorStreak = 0
         syncAttachedAt.set(SystemClock.elapsedRealtime())
         attachSyncRecovery(sync)
         sync.start()
@@ -2084,7 +2105,7 @@ class DefaultMatrixRepository @Inject constructor(
         val ids = buildList {
             primaryRoomId?.let(::add)
             activeTimelineRoomId?.let(::add)
-            _rooms.value.take(80).forEach { add(it.roomId.value) }
+            _rooms.value.take(200).forEach { add(it.roomId.value) }
         }.distinct()
         if (ids.isEmpty()) return
         scope.launch(dispatchers.io) {
@@ -2098,12 +2119,10 @@ class DefaultMatrixRepository @Inject constructor(
     private val syncWanted = AtomicBoolean(false)
     private val syncAttachedAt = AtomicLong(0)
     private val lastSyncKickAt = AtomicLong(0)
+    private val intentionalRestart = AtomicBoolean(false)
 
     @Volatile
     private var syncState: SyncServiceState = SyncServiceState.IDLE
-
-    @Volatile
-    private var syncErrorStreak: Int = 0
 
     /**
      * Sliding sync stops for good after a few failed long-polls. Watch the state,
@@ -2115,14 +2134,14 @@ class DefaultMatrixRepository @Inject constructor(
             override fun onUpdate(state: SyncServiceState) {
                 syncState = state
                 Log.i("NgSync", "state=$state")
-                if (!syncWanted.get()) return
-                if (state == SyncServiceState.RUNNING) {
-                    syncErrorStreak = 0
-                    return
-                }
+                if (!syncWanted.get() || intentionalRestart.get()) return
+                if (state == SyncServiceState.RUNNING) return
                 val warmingUp = SystemClock.elapsedRealtime() - syncAttachedAt.get() < 4_000L
                 if (warmingUp && state == SyncServiceState.IDLE) return
-                if (state == SyncServiceState.ERROR || state == SyncServiceState.TERMINATED) {
+                if (state == SyncServiceState.ERROR ||
+                    state == SyncServiceState.TERMINATED ||
+                    state == SyncServiceState.OFFLINE
+                ) {
                     scope.launch { kickSync("state-$state") }
                 }
             }
@@ -2138,34 +2157,39 @@ class DefaultMatrixRepository @Inject constructor(
                     live?.let { subscribeToLiveRooms(it, activeTimelineRoomId, force = true) }
                     runCatching { refreshRoomPreviewsFromSdk() }
                         .onFailure { Log.w("NgSync", "preview refresh failed", it) }
-                } else if (state != SyncServiceState.OFFLINE || appInForeground) {
+                } else {
                     kickSync("watch-$state")
                 }
             }
         }
     }
 
-    private suspend fun kickSync(reason: String) {
+    private suspend fun kickSync(reason: String, force: Boolean = false) {
         if (!syncWanted.get()) return
         val now = SystemClock.elapsedRealtime()
         if (now - lastSyncKickAt.get() < 2_500L) return
         lastSyncKickAt.set(now)
         val sync = mutex.withLock { syncService } ?: return
         val state = syncState
-        if (state == SyncServiceState.RUNNING) return
-        Log.w("NgSync", "restarting sync reason=$reason state=$state streak=$syncErrorStreak")
-        if (state == SyncServiceState.ERROR) {
-            syncErrorStreak += 1
-            if (syncErrorStreak >= 2) {
-                Log.w("NgSync", "dropping saved sliding-sync position")
+        if (!force && state == SyncServiceState.RUNNING) return
+        Log.w("NgSync", "restarting sync reason=$reason state=$state force=$force")
+        intentionalRestart.set(true)
+        try {
+            // stop() cancels a long-poll that is still marked running after the
+            // radio was frozen. Opening the app otherwise sits on that dead socket.
+            if (force || state != SyncServiceState.IDLE) {
                 runCatching { sync.stop() }
-                runCatching { sync.expireSessions() }
-                syncErrorStreak = 0
             }
+            runCatching { sync.start() }
+                .onFailure { Log.w("NgSync", "sync.start failed", it) }
+        } finally {
+            intentionalRestart.set(false)
         }
-        runCatching { sync.start() }
-            .onFailure { Log.w("NgSync", "sync.start failed", it) }
         subscribeToLiveRooms(sync, activeTimelineRoomId, force = true)
+        if (force) {
+            runCatching { refreshRoomPreviewsFromSdk() }
+                .onFailure { Log.w("NgSync", "preview refresh failed", it) }
+        }
     }
 
     private suspend fun refreshRoomPreviewsFromSdk() {
@@ -2204,15 +2228,7 @@ class DefaultMatrixRepository @Inject constructor(
                 started += 1
                 appInForeground = true
                 if (becameVisible && syncWanted.get()) {
-                    scope.launch {
-                        val sync = mutex.withLock { syncService } ?: return@launch
-                        if (syncState == SyncServiceState.RUNNING) {
-                            subscribeToLiveRooms(sync, activeTimelineRoomId, force = true)
-                            runCatching { refreshRoomPreviewsFromSdk() }
-                        } else {
-                            kickSync("foreground")
-                        }
-                    }
+                    scope.launch { kickSync("foreground", force = true) }
                 }
             }
 
@@ -2580,7 +2596,7 @@ class DefaultMatrixRepository @Inject constructor(
         return ClientBuilder()
             .sqliteStore(sqlite)
             .setSessionDelegate(delegate)
-            .userAgent("Teletrix/0.2.0")
+            .userAgent("Teletrix/0.3.0")
             .autoEnableBackups(true)
             .autoEnableCrossSigning(true)
             .enableShareHistoryOnInvite(true)

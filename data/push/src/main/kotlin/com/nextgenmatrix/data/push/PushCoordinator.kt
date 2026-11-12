@@ -13,7 +13,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import okhttp3.Call
 import org.unifiedpush.android.connector.UnifiedPush
+import java.util.concurrent.atomic.AtomicReference
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -38,6 +40,8 @@ class PushCoordinator @Inject constructor(
 
     @Volatile
     private var unifiedPushReady = false
+
+    private val ntfyCall = AtomicReference<Call?>(null)
 
     init {
         notifier.ensureChannels()
@@ -84,7 +88,8 @@ class PushCoordinator @Inject constructor(
         if (url.isBlank()) return
         unifiedPushReady = true
         prefs.edit().putString(KEY_UP_ENDPOINT, url).apply()
-        stopNtfy()
+        ntfyCall.getAndSet(null)?.cancel()
+        startConnectionService()
         scope.launch { runCatching { matrix.registerHttpPusher(url) } }
     }
 
@@ -92,6 +97,29 @@ class PushCoordinator @Inject constructor(
         unifiedPushReady = false
         prefs.edit().remove(KEY_UP_ENDPOINT).apply()
         if (matrix.isLoggedIn.value) startNtfyFallback()
+    }
+
+    fun shouldStreamNtfy(): Boolean = !unifiedPushReady
+
+    fun ntfySince(): String = prefs.getString(KEY_NTFY_SINCE, null)?.takeIf { it.isNotBlank() } ?: "10m"
+
+    fun attachNtfyCall(call: Call) {
+        ntfyCall.getAndSet(call)?.cancel()
+    }
+
+    fun onNtfyLine(line: String) {
+        val parsed = parseNtfyLine(line) ?: return
+        parsed.messageId?.let { id ->
+            prefs.edit().putString(KEY_NTFY_SINCE, id).apply()
+        }
+        val push = parsed.push ?: return
+        scope.launch {
+            if (!matrix.isLoggedIn.value) {
+                runCatching { matrix.restoreSession() }
+            }
+            val item = matrix.notificationForEvent(push.roomId, push.eventId)
+            if (item != null) notifier.show(item)
+        }
     }
 
     fun handlePushBytes(bytes: ByteArray) {
@@ -120,13 +148,15 @@ class PushCoordinator @Inject constructor(
                 if (!unifiedPushReady && matrix.isLoggedIn.value) startNtfyFallback()
             }
         }
+        startConnectionService()
     }
 
     private fun onSignedOut() {
         unifiedPushReady = false
+        ntfyCall.getAndSet(null)?.cancel()
         notifier.clearAllMessages()
         runCatching { UnifiedPush.unregister(context) }
-        stopNtfy()
+        context.stopService(Intent(context, TeletrixNtfyService::class.java))
         prefs.edit().clear().apply()
     }
 
@@ -142,6 +172,10 @@ class PushCoordinator @Inject constructor(
         val topic = ntfyTopic()
         val pushkey = "https://ntfy.sh/$topic"
         scope.launch { runCatching { matrix.registerHttpPusher(pushkey) } }
+        startConnectionService()
+    }
+
+    private fun startConnectionService() {
         val intent = Intent(context, TeletrixNtfyService::class.java)
         runCatching {
             if (Build.VERSION.SDK_INT >= 26) {
@@ -150,10 +184,6 @@ class PushCoordinator @Inject constructor(
                 context.startService(intent)
             }
         }
-    }
-
-    private fun stopNtfy() {
-        context.stopService(Intent(context, TeletrixNtfyService::class.java))
     }
 
     fun ntfyTopic(): String {
@@ -167,5 +197,6 @@ class PushCoordinator @Inject constructor(
     private companion object {
         const val KEY_UP_ENDPOINT = "up_endpoint"
         const val KEY_NTFY_TOPIC = "ntfy_topic"
+        const val KEY_NTFY_SINCE = "ntfy_since"
     }
 }
