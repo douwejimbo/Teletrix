@@ -181,6 +181,7 @@ data class IncomingNotification(
     val isReaction: Boolean = false,
     val jumpEventId: String? = null,
     val reactionKey: String? = null,
+    val eventTimestampMs: Long = 0L,
 )
 
 data class ModerationCapabilities(

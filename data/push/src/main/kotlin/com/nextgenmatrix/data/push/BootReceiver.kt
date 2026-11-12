@@ -3,6 +3,7 @@ package com.nextgenmatrix.data.push
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import androidx.core.content.ContextCompat
 import com.nextgenmatrix.matrix.MatrixRepository
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
@@ -21,6 +22,12 @@ class BootReceiver : BroadcastReceiver() {
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 matrix.restoreSession()
+                runCatching {
+                    ContextCompat.startForegroundService(
+                        context,
+                        Intent(context, TeletrixNtfyService::class.java),
+                    )
+                }
             } finally {
                 pending.finish()
             }
